@@ -10,12 +10,11 @@ function ReportPage() {
 
   const {
     role,
-    industry,
-    mainIndustry,
-    subIndustry,
-    rawMonthlySales,
+    gu_name,
+    region,
+    category_large,
+    category_small,
     purpose,
-    selectedDistrict,
   } = location.state || {}
 
   const [report, setReport] = useState(null)
@@ -27,12 +26,11 @@ function ReportPage() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         role,
-        industry,
-        mainIndustry,
-        subIndustry,
-        rawMonthlySales,
+        gu_name,
+        region,
+        category_large,
+        category_small,
         purpose,
-        selectedDistrict,
       }),
     })
       .then((res) => res.json())
@@ -43,7 +41,7 @@ function ReportPage() {
         console.error('리포트 요청 실패:', err)
         alert('리포트를 받아오는 데 실패했습니다.')
       })
-  }, [role, industry, selectedDistrict])
+  }, [role, gu_name, region, category_large, category_small, purpose])
 
   return (
     <div
@@ -119,73 +117,17 @@ function ReportPage() {
         >
           상권 분석 결과 리포트
         </h1>
-        <p style={{ marginTop: '0.5rem' }}>{report.summary}</p>
         {report ? (
-          <div>
-            <h2
-              style={{
-                color: '#A5B4FC',
-                fontWeight: 'bold',
-                marginTop: '2rem',
-              }}
-            >
-              기본 지역 정보
-            </h2>
-            <h2
-              style={{
-                color: '#A5B4FC',
-                fontWeight: 'bold',
-                marginTop: '2rem',
-              }}
-            >
-              상권 변화
-            </h2>
-            <h2
-              style={{
-                color: '#A5B4FC',
-                fontWeight: 'bold',
-                marginTop: '2rem',
-              }}
-            >
-              생존율 및 영업 기간
-            </h2>
-            <h2
-              style={{
-                color: '#A5B4FC',
-                fontWeight: 'bold',
-                marginTop: '2rem',
-              }}
-            >
-              개폐업 추이 및 진입 위험도
-            </h2>
-            <h2
-              style={{
-                color: '#A5B4FC',
-                fontWeight: 'bold',
-                marginTop: '2rem',
-              }}
-            >
-              인구 및 유동 인구 특성
-            </h2>
-            <h2
-              style={{
-                color: '#A5B4FC',
-                fontWeight: 'bold',
-                marginTop: '2rem',
-              }}
-            >
-              임대료 수준
-            </h2>
-            <h2
-              style={{
-                color: '#A5B4FC',
-                fontWeight: 'bold',
-                marginTop: '2rem',
-              }}
-            >
-              매출 특성 요약
-            </h2>
-          </div>
+          <>
+            <p style={{ marginTop: '0.5rem' }}>{report.summary}</p>
+            <h2 style={{ color: '#A5B4FC', fontWeight: 'bold', marginTop: '2rem' }}>기본 지역 정보</h2>
+            <h2 style={{ color: '#A5B4FC', fontWeight: 'bold', marginTop: '2rem' }}>상권 변화</h2>
+            <h2 style={{ color: '#A5B4FC', fontWeight: 'bold', marginTop: '2rem' }}>생존율 및 영업 기간</h2>
+            <h2 style={{ color: '#A5B4FC', fontWeight: 'bold', marginTop: '2rem' }}>개폐업 추이 및 진입 위험도</h2>
+            <h2 style={{ color: '#A5B4FC', fontWeight: 'bold', marginTop: '2rem' }}>인구 및 유동 인구 특성</h2>
+            <h2 style={{ color: '#A5B4FC', fontWeight: 'bold', marginTop: '2rem' }}>임대료 수준</h2>
+            <h2 style={{ color: '#A5B4FC', fontWeight: 'bold', marginTop: '2rem' }}>매출 특성 요약</h2>
+          </>
         ) : (
           <p>리포트를 불러오는 중입니다...</p>
         )}

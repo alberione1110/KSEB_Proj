@@ -7,22 +7,24 @@ import bgimg2 from '../img/bgimg2.jpg'
 function RecommendIndustryPage() {
   const navigate = useNavigate()
   const location = useLocation()
-  const selectedDistrict = location.state?.district
-  const role = location.state?.role || '예비사장' // 기본값: 예비사장
-  const [district, setDistrict] = useState('')
+
+  const {
+    role = '예비사장',
+    gu_name,
+    region,
+  } = location.state || {}
+
   const [recommendations, setRecommendations] = useState([])
   const [expandedIndex, setExpandedIndex] = useState(null)
   const [selectedIndex, setSelectedIndex] = useState(null)
 
   useEffect(() => {
     window.scrollTo(0, 0)
-    if (selectedDistrict) {
-      setDistrict(selectedDistrict.label)
-
+    if (gu_name && region) {
       fetch('http://localhost:5001/api/recommend/industry', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ district: selectedDistrict.label }),
+        body: JSON.stringify({ gu_name, region }),
       })
         .then((res) => res.json())
         .then((data) => {
@@ -37,7 +39,7 @@ function RecommendIndustryPage() {
           alert('추천 요청 실패')
         })
     }
-  }, [selectedDistrict])
+  }, [gu_name, region])
 
   return (
     <div
@@ -124,12 +126,10 @@ function RecommendIndustryPage() {
             fontWeight: 'bold',
           }}
         >
-          {district || '지역 없음'}에서 추천되는 유망 업종은?
+          {`${gu_name || ''} ${region || ''}`}에서 추천되는 유망 업종은?
         </h1>
 
-        <div
-          style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}
-        >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
           {recommendations.map((rec, index) => (
             <div
               key={index}
@@ -166,7 +166,7 @@ function RecommendIndustryPage() {
                   marginBottom: '0.5rem',
                 }}
               >
-                {rec.industry}
+                {rec.category_small}
               </h2>
 
               {expandedIndex === index ? (
@@ -223,10 +223,10 @@ function RecommendIndustryPage() {
               navigate('/report', {
                 state: {
                   role,
-                  industry: recommendations[selectedIndex].industry, // key 수정
-                  selectedDistrict: district, // key 수정
-                  mainIndustry: null,
-                  subIndustry: null,
+                  gu_name,
+                  region,
+                  category_large: recommendations[selectedIndex].category_large,
+                  category_small: recommendations[selectedIndex].category_small,
                   rawMonthlySales: null,
                   purpose: null,
                 },

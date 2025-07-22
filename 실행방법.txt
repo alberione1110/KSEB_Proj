@@ -1,0 +1,11 @@
+<back>
+d ~/Documents/project/KSEB_Proj
+source venv/bin/activate
+cd back
+python app.py
+
+<front>
+npm start
+
+<가상환경 종료>
+disactivate

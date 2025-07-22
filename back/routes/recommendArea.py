@@ -12,10 +12,12 @@ bp = Blueprint('recommend_area', __name__)
 @bp.route('/recommend/area', methods=['POST'])
 def recommend_area_route():
     data = request.json
-    industry = data.get('industry')
+    category_small = data.get('category_small')
+    gu_name = data.get('gu_name')
 
-    if not industry:
-        return jsonify({'error': 'Missing industry'}), 400
+    if not category_small or not gu_name:
+        return jsonify({'error': 'Missing category_small or gu_name'}), 400
 
-    result = recommend_area.get_recommendation(industry)
+    # 🔧 인자 순서 수정: category_small이 첫 번째
+    result = recommend_area.get_recommendation(category_small, gu_name)
     return jsonify({'recommendations': result})

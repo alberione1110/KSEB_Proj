@@ -8,15 +8,14 @@ function RecommendAreaPage() {
   const navigate = useNavigate()
   const location = useLocation()
 
-  // ✅ location.state에서 모든 값 추출
   const {
     role,
-    industry,
-    mainIndustry,
-    subIndustry,
+    gu_name,
+    region,
+    category_large,
+    category_small,
     rawMonthlySales,
     purpose,
-    selectedDistrict: prevSelectedDistrict,
   } = location.state || {}
 
   const [recommendations, setRecommendations] = useState([])
@@ -25,11 +24,11 @@ function RecommendAreaPage() {
 
   useEffect(() => {
     window.scrollTo(0, 0)
-    if (industry) {
+    if (gu_name && category_small) {
       fetch('http://localhost:5001/api/recommend/area', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ industry }),
+        body: JSON.stringify({ gu_name, category_small }),
       })
         .then((res) => res.json())
         .then((data) => {
@@ -39,7 +38,7 @@ function RecommendAreaPage() {
           console.error('추천 요청 실패:', err)
         })
     }
-  }, [industry])
+  }, [gu_name, category_small])
 
   return (
     <div
@@ -53,7 +52,6 @@ function RecommendAreaPage() {
         color: 'white',
       }}
     >
-      {/* 어두운 배경 */}
       <div
         style={{
           position: 'absolute',
@@ -66,7 +64,6 @@ function RecommendAreaPage() {
         }}
       />
 
-      {/* 네비게이션 */}
       <nav
         style={{
           display: 'flex',
@@ -110,7 +107,6 @@ function RecommendAreaPage() {
         </div>
       </nav>
 
-      {/* 콘텐츠 */}
       <div
         style={{
           padding: '4rem 2rem 2rem',
@@ -131,15 +127,11 @@ function RecommendAreaPage() {
             fontWeight: 'bold',
           }}
         >
-          {industry || '업종 없음'}에 적합한 지역은?
+          {category_small || '업종 없음'}에 적합한 지역은?
         </h1>
 
         <div
-          style={{
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '1.5rem',
-          }}
+          style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}
         >
           {recommendations.map((rec, index) => (
             <div
@@ -147,7 +139,7 @@ function RecommendAreaPage() {
               onClick={() => setSelectedIndex(index)}
               style={{
                 backgroundColor: selectedIndex === index ? '#e0e7ff' : 'white',
-                color: selectedIndex === index ? '#000' : '#000',
+                color: '#000',
                 padding: '1.5rem',
                 borderRadius: '16px',
                 boxShadow:
@@ -223,7 +215,6 @@ function RecommendAreaPage() {
           ))}
         </div>
 
-        {/* 리포트 이동 버튼 */}
         <div style={{ textAlign: 'center', marginTop: '3rem' }}>
           <button
             onClick={() => {
@@ -231,13 +222,18 @@ function RecommendAreaPage() {
                 alert('지역을 하나 선택해주세요!')
                 return
               }
+              const selectedFull = recommendations[selectedIndex].district
+              const parts = selectedFull.split(' ')
+              const selectedGu = parts[0] || ''
+              const selectedDong = parts[1] || ''
+
               navigate('/report', {
                 state: {
                   role,
-                  selectedDistrict: recommendations[selectedIndex].district,
-                  industry,
-                  mainIndustry,
-                  subIndustry,
+                  gu_name: selectedGu,
+                  region: selectedDong,
+                  category_large,
+                  category_small,
                   rawMonthlySales,
                   purpose,
                 },

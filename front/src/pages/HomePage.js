@@ -543,10 +543,10 @@ function HomePage() {
               style={{ display: 'flex', justifyContent: 'center', gap: '1rem' }}
             >
               <button
-                onClick={() => setPurpose('market')}
+                onClick={() => setPurpose('시장조사')}
                 style={{
                   backgroundColor:
-                    purpose === 'market' ? '#262f95ff' : '#726EFF',
+                    purpose === '시장조사' ? '#262f95ff' : '#726EFF',
                   color: 'white',
                   padding: '0.8rem 1.5rem',
                   borderRadius: '12px',
@@ -558,10 +558,10 @@ function HomePage() {
                 단순 시장 조사
               </button>
               <button
-                onClick={() => setPurpose('expand')}
+                onClick={() => setPurpose('확장')}
                 style={{
                   backgroundColor:
-                    purpose === 'expand' ? '#262f95ff' : '#726EFF',
+                    purpose === '확장' ? '#262f95ff' : '#726EFF',
                   color: 'white',
                   padding: '0.8rem 1.5rem',
                   borderRadius: '12px',
@@ -611,11 +611,17 @@ function HomePage() {
                     return
                   }
 
+                  // 지역 정보 분리
+                  const gu_name = selectedDistrict.label?.split(' ')[0] || ''
+                  const region = selectedDistrict.label?.split(' ')[1] || ''
+
+                  // 동 단위인지 판별
                   const dongRegex = /.+구\s.+동$/
                   const isDongUnit = dongRegex.test(
                     selectedDistrict.label || ''
                   )
 
+                  // 동 단위가 아닐 경우 지역 추천 페이지로 이동
                   if (!isDongUnit) {
                     alert(
                       '선택한 지역이 너무 넓어 지역 추천 페이지로 이동합니다.'
@@ -623,9 +629,9 @@ function HomePage() {
                     navigate('/recommend/area', {
                       state: {
                         role: 'owner',
-                        selectedDistrict,
-                        mainIndustry: mainIndustry.label,
-                        subIndustry: subIndustry.label,
+                        gu_name,
+                        category_large: mainIndustry.label,
+                        category_small: subIndustry.label,
                         rawMonthlySales,
                         purpose,
                       },
@@ -633,12 +639,14 @@ function HomePage() {
                     return
                   }
 
+                  // 동 단위면 리포트 페이지로 이동
                   navigate('/report', {
                     state: {
                       role: 'owner',
-                      selectedDistrict,
-                      mainIndustry: mainIndustry.label,
-                      subIndustry: subIndustry.label,
+                      gu_name,
+                      region,
+                      category_large: mainIndustry.label,
+                      category_small: subIndustry.label,
                       rawMonthlySales,
                       purpose,
                     },
@@ -796,11 +804,13 @@ function HomePage() {
                   const dongRegex = /.+구\s.+동$/
                   const isDongUnit = dongRegex.test(districtLabel)
 
+                  const gu_name = districtLabel.split(' ')[0] || ''
+                  const region = districtLabel.split(' ')[1] || ''
+
                   if (!isDongUnit) {
                     alert(
                       '선택한 지역이 너무 넓어 지역 추천 페이지로 이동합니다.'
                     )
-                    // ✅ 구 or 시 단위일 때 → 지역 추천 백엔드 요청
                     try {
                       const response = await fetch(
                         'http://localhost:5001/api/recommend/area',
@@ -810,7 +820,8 @@ function HomePage() {
                             'Content-Type': 'application/json',
                           },
                           body: JSON.stringify({
-                            industry: subIndustry.label, // 또는 mainIndustry.label (원하는 기준에 따라)
+                            gu_name,
+                            category_small: subIndustry.label,
                           }),
                         }
                       )
@@ -824,9 +835,10 @@ function HomePage() {
                       navigate('/recommend/area', {
                         state: {
                           role: 'preOwner',
-                          selectedDistrict,
-                          industry: subIndustry.label,
+                          gu_name,
+                          category_small: subIndustry.label,
                           recommendations: data.recommendations,
+                          purpose: '창업 준비',
                         },
                       })
                     } catch (err) {
@@ -836,8 +848,16 @@ function HomePage() {
                     return
                   }
 
-                  // ✅ 동 단위라면 report 페이지로 이동
-                  navigate('/report')
+                  // ✅ 동 단위이면 리포트로 이동
+                  navigate('/report', {
+                    state: {
+                      role: 'preOwner',
+                      gu_name,
+                      region,
+                      category_large: mainIndustry.label,
+                      category_small: subIndustry.label,
+                    },
+                  })
                 }}
               >
                 리포트 받으러 가기
@@ -883,11 +903,15 @@ function HomePage() {
                     return
                   }
 
+                  const gu_name = selectedDistrict.label?.split(' ')[0] || ''
+                  const region = selectedDistrict.label?.split(' ')[1] || ''
+
                   try {
                     const response = await axios.post(
                       'http://localhost:5001/api/recommend/industry',
                       {
-                        district: selectedDistrict.label,
+                        gu_name,
+                        region,
                       }
                     )
 
@@ -895,9 +919,11 @@ function HomePage() {
 
                     navigate('/recommend/industry', {
                       state: {
-                        role: '예비사장', // ✅ 역할 추가
-                        district: selectedDistrict,
-                        recommendations: recommendations,
+                        role: '예비사장',
+                        gu_name,
+                        region,
+                        recommendations,
+                        purpose: '창업 준비',
                       },
                     })
                   } catch (error) {
