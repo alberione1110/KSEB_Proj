@@ -54,3 +54,43 @@ button:hover {
 #role-preowner-card:hover {
   transform: scale(1.05);
 }
+
+/* App.css */
+
+.scrollable {
+  scrollbar-width: thin;            /* Firefox */
+  scrollbar-color: rgba(255,255,255,0.2) transparent;
+}
+
+.scrollable::-webkit-scrollbar {
+  width: 6px;
+}
+
+.scrollable::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollable::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.2);
+  border-radius: 10px;
+  border: none;
+}
+
+/* 다크 테마용 커스텀 스크롤바 */
+.scrollable {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+
+.scrollable::-webkit-scrollbar {
+  width: 6px;
+}
+
+.scrollable::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollable::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.2);
+  border-radius: 10px;
+}

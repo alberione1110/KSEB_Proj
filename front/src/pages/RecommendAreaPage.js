@@ -78,21 +78,6 @@ function RecommendAreaPage() {
         <div>
           <button
             style={{
-              backgroundColor: '#726EFF',
-              color: 'white',
-              border: 'none',
-              borderRadius: '8px',
-              padding: '0.5rem 1rem',
-              fontWeight: 'bold',
-              marginRight: '1rem',
-              cursor: 'pointer',
-            }}
-            onClick={() => navigate('/chatbot')}
-          >
-            챗봇 상담
-          </button>
-          <button
-            style={{
               backgroundColor: 'transparent',
               border: '1px solid white',
               borderRadius: '8px',

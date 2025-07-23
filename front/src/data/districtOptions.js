@@ -1,6 +1,5 @@
 // 예시: src/data/districtOptions.js
 export const districtOptions = [
-  { value: "서울시 전체", label: "서울시 전체" },
   { value: "종로구", label: "종로구" },
   { value: "종로구 청운효자동", label: "종로구 청운효자동" },
   { value: "종로구 사직동", label: "종로구 사직동" },

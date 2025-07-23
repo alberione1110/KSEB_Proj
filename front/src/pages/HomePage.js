@@ -1,11 +1,11 @@
 import { useRef, useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import ksebLogo from '../img/kseb_logo.png'
-import seoulBg from '../img/seoul.avif'
+import seoulBg from '../img/seoul.jpeg'
 import ownerImg from '../img/owner.jpg'
 import preownerImg from '../img/preowner.jpg'
 import section2bg from '../img/section2.jpg'
-import section3bg from '../img/section3.jpg'
+import section3bg from '../img/section3.png'
 import '../App.css'
 import Select from 'react-select'
 import districtOptions from '../data/districtOptions'
@@ -90,7 +90,7 @@ function HomePage() {
               left: 0,
               right: 0,
               bottom: 0,
-              backgroundColor: 'rgba(0,0,0,0.5)',
+              backgroundColor: 'rgba(0,0,0,0.3)',
               zIndex: 1,
             }}
           />
@@ -108,20 +108,6 @@ function HomePage() {
           >
             <img src={ksebLogo} alt="KSEB Logo" style={{ width: '100px' }} />
             <div>
-              <button
-                style={{
-                  backgroundColor: '#726EFF',
-                  color: 'white',
-                  border: 'none',
-                  borderRadius: '8px',
-                  padding: '0.5rem 1rem',
-                  fontWeight: 'bold',
-                  marginRight: '1rem',
-                }}
-                onClick={() => navigate('/chatbot')}
-              >
-                챗봇 상담
-              </button>
               <button
                 style={{
                   backgroundColor: 'transparent',

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import '../App.css'
 import ksebLogo from '../img/kseb_logo.png'
-import bgimg2 from '../img/bgimg2.jpg'
+import bgimg2 from '../img/bgimg2.jpeg'
 
 function RecommendIndustryPage() {
   const navigate = useNavigate()
@@ -60,7 +60,7 @@ function RecommendIndustryPage() {
           left: 0,
           right: 0,
           bottom: 0,
-          backgroundColor: 'rgba(0,0,0,0.5)',
+          backgroundColor: 'rgba(0,0,0,0.3)',
           zIndex: 0,
         }}
       />
@@ -77,20 +77,6 @@ function RecommendIndustryPage() {
       >
         <img src={ksebLogo} alt="KSEB Logo" style={{ width: '100px' }} />
         <div>
-          <button
-            style={{
-              backgroundColor: '#726EFF',
-              color: 'white',
-              border: 'none',
-              borderRadius: '8px',
-              padding: '0.5rem 1rem',
-              fontWeight: 'bold',
-              marginRight: '1rem',
-            }}
-            onClick={() => navigate('/chatbot')}
-          >
-            챗봇 상담
-          </button>
           <button
             style={{
               backgroundColor: 'transparent',
