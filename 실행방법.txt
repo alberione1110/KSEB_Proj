@@ -1,6 +1,10 @@
-<back>
+<가상환경이 있을 때 back>
 d ~/Documents/project/KSEB_Proj
 source venv/bin/activate
+cd back
+python app.py
+
+<가상환경이 없을 때 back>
 cd back
 python app.py
 

@@ -1,6 +1,7 @@
 // ReportPage.jsx
-import { useEffect, useState, useRef } from 'react'
+import React, { useEffect, useState, useRef } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
+import * as echarts from 'echarts'
 import '../App.css'
 import ksebLogo from '../img/kseb_logo.png'
 import bgimg3 from '../img/bgimg3.jpeg'
@@ -135,6 +136,7 @@ function ReportPage() {
   const location = useLocation()
   const { role, gu_name, region, category_large, category_small, purpose } =
     location.state || {}
+
   const [report, setReport] = useState(null)
   const [showChatbot, setShowChatbot] = useState(false)
 
@@ -153,38 +155,101 @@ function ReportPage() {
       }),
     })
       .then((res) => res.json())
-      .then((data) => setReport(data))
+      .then((data) => {
+        setReport(data)
+      })
       .catch((err) => {
         console.error('리포트 요청 실패:', err)
         alert('리포트를 받아오는 데 실패했습니다.')
       })
   }, [role, gu_name, region, category_large, category_small, purpose])
 
+  useEffect(() => {
+    if (report) {
+      drawCharts()
+    }
+  }, [report])
+
+  // ✅ 차트 렌더 함수 (간단화 버전)
+  const drawCharts = () => {
+    const chartData = report.chart_data
+    const zoneIds = report.zone_ids.map(String)
+
+    const renderBar = (id, labels, values, title, unit = '') => {
+      const el = document.getElementById(id)
+      if (!el) return
+      const chart = echarts.init(el)
+      chart.setOption({
+        title: { text: title, left: 'center' },
+        tooltip: { trigger: 'axis' },
+        xAxis: { type: 'category', data: labels },
+        yAxis: { type: 'value' },
+        series: [{ type: 'bar', data: values }],
+      })
+    }
+
+    const renderLine = (id, labels, values, title) => {
+      const el = document.getElementById(id)
+      if (!el) return
+      const chart = echarts.init(el)
+      chart.setOption({
+        title: { text: title, left: 'center' },
+        tooltip: { trigger: 'axis' },
+        xAxis: { type: 'category', data: labels },
+        yAxis: { type: 'value' },
+        series: [{ type: 'line', data: values }],
+      })
+    }
+
+    const renderPie = (id, labels, values, title) => {
+      const el = document.getElementById(id)
+      if (!el) return
+      const chart = echarts.init(el)
+      chart.setOption({
+        title: { text: title, left: 'center' },
+        tooltip: { trigger: 'item' },
+        series: [{
+          type: 'pie',
+          radius: '50%',
+          data: labels.map((l, i) => ({ name: l, value: values[i] })),
+        }],
+      })
+    }
+
+    // 기본 차트
+    if (chartData?.store_yearly)
+      renderLine('store_yearly_chart', chartData.store_yearly.labels, chartData.store_yearly.values, '연도별 점포 수 변화')
+
+    if (chartData?.survival)
+      renderBar('survival_chart', chartData.survival.labels, chartData.survival.values, '생존율', '%')
+
+    if (chartData?.rent)
+      renderBar('rent_chart', chartData.rent.labels, chartData.rent.values, '임대료', '원')
+
+    if (chartData?.open_close)
+      renderLine('open_close_chart', chartData.open_close.labels, chartData.open_close.open, '개업 수')
+
+    // zone별 차트
+    if (chartData?.sales) {
+      zoneIds.forEach(zoneId => {
+        const zone = chartData.sales[zoneId]
+        if (!zone) return
+        renderBar(`sales_day_${zoneId}`, zone.sales_by_day.labels, zone.sales_by_day.values, '요일별 매출')
+        renderBar(`sales_hour_${zoneId}`, zone.sales_by_hour.labels, zone.sales_by_hour.values, '시간대별 매출')
+        renderPie(`sales_gender_${zoneId}`, zone.sales_by_gender.labels, zone.sales_by_gender.values, '성별 매출')
+        renderBar(`sales_age_${zoneId}`, zone.sales_by_age_group.labels, zone.sales_by_age_group.values, '연령별 매출')
+      })
+    }
+  }
+
   const reportCardStyle = {
     width: '100%',
-    maxWidth: '900px',
-    height: '90vh',
+    maxWidth: '1000px',
     minHeight: '700px',
     backgroundColor: 'rgba(255, 255, 255, 1)',
     borderRadius: '20px',
     padding: '2.5rem',
     overflowY: 'auto',
-    boxShadow: '0 0 20px rgba(0,0,0,0.3)',
-    boxSizing: 'border-box',
-    display: 'flex',
-    flexDirection: 'column',
-    color: 'black',
-    textAlign:'left'
-  }
-
-  const chatbotCardStyle = {
-    width: '100%',
-    maxWidth: '600px',
-    height: '90vh',
-    backgroundColor: 'rgba(255,255,255,0.6)',
-    borderRadius: '20px',
-    padding: '2rem',
-    overflow: 'hidden',
     boxShadow: '0 0 20px rgba(0,0,0,0.3)',
     boxSizing: 'border-box',
     display: 'flex',
@@ -244,36 +309,33 @@ function ReportPage() {
         }}
       >
         <div style={reportCardStyle}>
-          <h1
-            style={{
-              textAlign: 'center',
-              marginBottom: '1rem',
-              fontSize: '2rem',
-              fontWeight: 'bold',
-            }}
-          >
+          <h1 style={{ textAlign: 'center', fontSize: '2rem', fontWeight: 'bold' }}>
             상권 분석 결과 리포트
           </h1>
-          <div style={{ flex: 1, overflowY: 'auto' }}>
-            {report ? (
-              <>
-                <p>{report.summary}</p>
-                <h2 style={{ marginTop: '2rem' }}>기본 지역 정보</h2>
-                <h2 style={{ marginTop: '2rem' }}>상권 변화</h2>
-                <h2 style={{ marginTop: '2rem' }}>생존율 및 영업 기간</h2>
-                <h2 style={{ marginTop: '2rem' }}>
-                  개폐업 추이 및 진입 위험도
-                </h2>
-                <h2 style={{ marginTop: '2rem' }}>
-                  인구 및 유동 인구 특성
-                </h2>
-                <h2 style={{ marginTop: '2rem' }}>임대료 수준</h2>
-                <h2 style={{ marginTop: '2rem' }}>매출 특성 요약</h2>
-              </>
-            ) : (
-              <p>리포트를 불러오는 중입니다...</p>
-            )}
-          </div>
+          {report ? (
+            <>
+              <p style={{ marginBottom: '2rem', color: '#444' }}>{report.summary}</p>
+              {report.sections.map((section, idx) => (
+                <div key={idx} style={{ marginBottom: '2rem' }}>
+                  <h2 style={{ fontSize: '1.3rem', marginBottom: '0.5rem' }}>{section.title}</h2>
+                  <p style={{ whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{section.content}</p>
+                  <div id={getChartIdFromTitle(section.title)} style={{ width: '100%', height: '400px' }} />
+                </div>
+              ))}
+              <h2 style={{ marginTop: '3rem' }}>📈 매출 특성 요약</h2>
+              {report.zone_ids.map((zoneId) => (
+                <div key={zoneId} style={{ marginBottom: '3rem' }}>
+                  <h3>📍 Zone ID: {zoneId}</h3>
+                  <div id={`sales_day_${zoneId}`} style={{ width: '100%', height: '300px' }} />
+                  <div id={`sales_hour_${zoneId}`} style={{ width: '100%', height: '300px' }} />
+                  <div id={`sales_gender_${zoneId}`} style={{ width: '100%', height: '300px' }} />
+                  <div id={`sales_age_${zoneId}`} style={{ width: '100%', height: '300px' }} />
+                </div>
+              ))}
+            </>
+          ) : (
+            <p>리포트를 불러오는 중입니다...</p>
+          )}
           {!showChatbot && (
             <div style={{ textAlign: 'center', marginTop: '2rem' }}>
               <button
@@ -295,10 +357,37 @@ function ReportPage() {
           )}
         </div>
 
-        {showChatbot && <div style={chatbotCardStyle}><ChatbotPanel /></div>}
+        {showChatbot && (
+          <div
+            style={{
+              width: '100%',
+              maxWidth: '600px',
+              height: '90vh',
+              backgroundColor: 'rgba(255,255,255,0.6)',
+              borderRadius: '20px',
+              padding: '2rem',
+              overflow: 'hidden',
+              boxShadow: '0 0 20px rgba(0,0,0,0.3)',
+              display: 'flex',
+              flexDirection: 'column',
+              color: 'black',
+            }}
+          >
+            <ChatbotPanel />
+          </div>
+        )}
       </div>
     </div>
   )
+}
+
+// 섹션 제목에 따라 고유 차트 id 반환
+function getChartIdFromTitle(title) {
+  if (title.includes('상권 변화')) return 'store_yearly_chart'
+  if (title.includes('생존율')) return 'survival_chart'
+  if (title.includes('임대료')) return 'rent_chart'
+  if (title.includes('개폐업')) return 'open_close_chart'
+  return ''
 }
 
 export default ReportPage

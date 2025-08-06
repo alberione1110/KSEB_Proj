@@ -7,7 +7,7 @@ import google.generativeai as genai
 import pymysql
 import json
 
-def get_recommendation(gu_name, region) :
+def run_industry_recommendation(region, gu_name) :
     # RDS 정보
     host = 'daktor-commercial-prod.czig88k8s0e8.ap-northeast-2.rds.amazonaws.com'
     port = 3306
