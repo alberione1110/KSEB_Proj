@@ -65,8 +65,8 @@ def run_industry_recommendation(region, gu_name) :
 
         if use_region_code:
             conditions.append(f"region_code LIKE '{dong_code}%%'")
-        elif target_dong and category_col:
-            conditions.append(f"{category_col} = '{target_dong}'")
+        elif region and category_col:
+            conditions.append(f"{category_col} = '{region}'")
         if indicator_val and indicator_col:
             conditions.append(f"{indicator_col} = '{indicator_val}'")
         if extra_condition:
@@ -77,31 +77,27 @@ def run_industry_recommendation(region, gu_name) :
         return pd.read_sql(sql, engine)
 
     def query_sales(table, service_code=None):
-        cond = f"region_name = '{target_dong}'"
+        cond = f"region_name = '{region}'"
         if service_code:
             cond += f" AND service_code = '{service_code}'"
         sql = f"SELECT * FROM {table} WHERE {cond} ORDER BY service_code, zone_id, year, quarter"
         df = pd.read_sql(sql, engine)
         return df.drop_duplicates(subset=["region_name", "year", "quarter", "service_code", "monthly_sales"])
 
-    def add_region_service_names(df, zone_df, service_df, target_dong=None):
+    def add_region_service_names(df, zone_df, service_df, region=None):
         df['zone_id'] = df['zone_id'].astype(str)
         zone_df['zone_id'] = zone_df['zone_id'].astype(str)
 
         df = df.merge(zone_df, on='zone_id', how='left')
         df = df.merge(service_df, on='service_code', how='left')
-        if target_dong:
-            df = df[df['region_name'] == target_dong]
+        if region:
+            df = df[df['region_name'] == region]
         return df
 
-    # 사용자 입력
-    target_gu = '{gu_name}'
-    target_dong = '{region}'
-
     # 구/동 코드 조회
-    dong_query = f"SELECT DISTINCT region_code FROM subcategory_avg_operating_period_stats WHERE region_name = '{target_dong}' LIMIT 1"
+    dong_query = f"SELECT DISTINCT region_code FROM subcategory_avg_operating_period_stats WHERE region_name = '{region}' LIMIT 1"
     dong_code = pd.read_sql(dong_query, engine).iloc[0]['region_code']
-    print(f"선택한 동 '{target_dong}'의 지역 코드: {dong_code}")
+    print(f"선택한 동 '{region}'의 지역 코드: {dong_code}")
 
     # 기본 테이블 불러오기
     zone_df = load_table('zone_table')
@@ -140,8 +136,8 @@ def run_industry_recommendation(region, gu_name) :
         gender_known = gender_df[gender_df['gender'].isin(['여성', '남성'])]
         gender_unknown = gender_df[~gender_df['gender'].isin(['여성', '남성'])]
 
-        gender_known = add_region_service_names(gender_known, zone_df, service_df, target_dong)
-        gender_unknown = add_region_service_names(gender_unknown, zone_df, service_df, target_dong)
+        gender_known = add_region_service_names(gender_known, zone_df, service_df, region)
+        gender_unknown = add_region_service_names(gender_unknown, zone_df, service_df, region)
 
         #----gender
         gender_sales[year] = gender_known[["region_name", "zone_id", "service_name", "service_code", "year", "quarter", "gender", "sales_amount"]] \
@@ -421,7 +417,7 @@ def run_industry_recommendation(region, gu_name) :
 
     # 모델 선택
     model = genai.GenerativeModel(model_name="models/gemini-2.5-flash")
-    def generate_business_summary(row, target_dong):
+    def generate_business_summary(row, region):
         업종명 = row['업종명']
         행정동명 = row['행정동명']
 
@@ -458,7 +454,7 @@ def run_industry_recommendation(region, gu_name) :
         # 프롬프트 완성
         prompt = f"""
     당신은 업종 추천 전문가입니다.
-    아래는 '{target_dong}' 지역에서 '{업종명}' 업종을 '{행정동명}' 내에 창업했을 때의 주요 지표입니다:
+    아래는 '{region}' 지역에서 '{업종명}' 업종을 '{행정동명}' 내에 창업했을 때의 주요 지표입니다:
 
     먼저 참고용 예시를 확인하세요:
     {few_shot_examples}
@@ -500,7 +496,7 @@ def run_industry_recommendation(region, gu_name) :
         else:
             large_label = '기타'  # 혹은 None 등 기본값 설정
 
-        reason = generate_business_summary(row, target_dong)
+        reason = generate_business_summary(row, region)
         recommendation_list.append({
             'category_large': large_label,
             'category_small': label,
@@ -509,7 +505,7 @@ def run_industry_recommendation(region, gu_name) :
 
     # ----JSON 저장----
     recommendation_dict = {
-        target_dong: recommendation_list
+        region: recommendation_list
     }
 
     # JSON 파일로 저장
