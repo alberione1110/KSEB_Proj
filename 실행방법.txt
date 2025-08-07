@@ -1,5 +1,5 @@
 <가상환경이 있을 때 back>
-cd ~/Documents/project/KSEB_Proj
+d ~/Documents/project/KSEB_Proj
 source venv/bin/activate
 cd back
 python app.py
