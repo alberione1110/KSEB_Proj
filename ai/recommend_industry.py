@@ -1,523 +1,426 @@
-import pandas as pd
-import numpy as np
-from sqlalchemy import create_engine
-from functools import reduce
-from sklearn.preprocessing import MinMaxScaler
-import google.generativeai as genai
-import pymysql
+# ai/recommend_industry.py
+import os
+import time
 import json
+import difflib
+import numpy as np
+import pandas as pd
+from sqlalchemy import text
+from sklearn.preprocessing import MinMaxScaler
 
-def run_industry_recommendation(region, gu_name) :
-    # RDS 정보
-    host = 'daktor-commercial-prod.czig88k8s0e8.ap-northeast-2.rds.amazonaws.com'
-    port = 3306
-    user = 'oesnue'
-    password = 'gPwls0105!' #안되면 gPwls0105
-    database = 'daktor_db'
+# DB/엔진은 환경변수에서 안전하게 로드
+from config.settings import get_engine
 
-    # 연결 시도
+# 선택: LLM
+try:
+    import google.generativeai as genai
+    from google.api_core.exceptions import ResourceExhausted, GoogleAPIError
+except Exception:
+    genai = None
+    ResourceExhausted = GoogleAPIError = Exception
+
+# ====== 환경설정 ======
+USE_LLM = os.getenv("USE_LLM", "1") == "1"
+TOPK_FOR_REASON = int(os.getenv("TOPK_FOR_REASON", "5"))
+REASON_CACHE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "reason_cache.json"))
+
+# ====== LLM (Gemini) 로딩 (있으면 사용, 없으면 폴백) ======
+_genai_available = False
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+if USE_LLM and genai and GEMINI_API_KEY:
     try:
-        conn = pymysql.connect(
-            host=host,
-            user=user,
-            password=password,
-            database=database,
-            port=port,
-            connect_timeout=5
-        )
-        print("✅ RDS 연결 성공")
+        genai.configure(api_key=GEMINI_API_KEY)
+        _genai_available = True
+    except Exception:
+        _genai_available = False
 
-        # 간단한 쿼리 테스트
-        with conn.cursor() as cursor:
-            cursor.execute("SHOW TABLES;")
-            for row in cursor.fetchall():
-                print(row)
+def _genai_model(model_name: str):
+    if not _genai_available:
+        return None
+    try:
+        # google-generativeai는 model_name 키워드 사용
+        return genai.GenerativeModel(model_name=model_name)
+    except Exception:
+        return None
 
-        conn.close()
+# ====== 간단 파일 캐시 ======
+def _load_reason_cache():
+    if os.path.exists(REASON_CACHE_PATH):
+        try:
+            with open(REASON_CACHE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
+def _save_reason_cache(cache):
+    os.makedirs(os.path.dirname(REASON_CACHE_PATH), exist_ok=True)
+    with open(REASON_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+_REASON_CACHE = _load_reason_cache()
+
+def _cache_key(gu_name, region, cat_small, date_key):
+    return f"{gu_name}::{region}::{cat_small}::{date_key}"
+
+# ====== 규칙 기반 이유 (LLM 폴백용) ======
+def rule_based_reason(row):
+    def _num(x, d=0):
+        try:
+            return round(float(x), d)
+        except Exception:
+            return 0
+    def _int(x):
+        try:
+            return int(float(x))
+        except Exception:
+            return 0
+
+    parts = []
+    parts.append(f"{row.get('업종명','해당 업종')} 업종은 점포수 {_int(row.get('점포수',0))}개 수준입니다.")
+    gy = _num(row.get('평균영업기간(년)', 0), 2)
+    if gy > 0:
+        parts.append(f"평균 영업기간이 약 {gy}년으로 안정성이 있습니다.")
+    for y in (2024, 2023, 2022):
+        col = f"{y}_평균매출"
+        val = _num(row.get(col, 0), 0)
+        if val > 0:
+            parts.append(f"{y}년 평균 매출이 양호합니다.")
+            break
+    s3 = _num(row.get('3년 생존율(%)', 0), 1)
+    if s3 > 0:
+        parts.append(f"3년 생존율 {s3}% 수준입니다.")
+    if not parts:
+        return "지역 수요와 경쟁 상황을 고려할 때 잠재력이 있는 업종으로 판단됩니다."
+    return " ".join(parts)
+
+# ====== LLM 이유 생성 (429/오류 → 폴백/캐시) ======
+def generate_reason_with_llm(gu_name, region, row, prefer_model="models/gemini-1.5-flash"):
+    date_key = time.strftime("%Y-%m-%d")
+    key = _cache_key(gu_name, region, row.get('업종명', ''), date_key)
+    if key in _REASON_CACHE:
+        return _REASON_CACHE[key], "cache"
+
+    if not _genai_available:
+        r = rule_based_reason(row)
+        _REASON_CACHE[key] = r; _save_reason_cache(_REASON_CACHE)
+        return r, "fallback-disabled"
+
+    prompt = f"""
+당신은 상권 분석 컨설턴트입니다. 아래 지표를 바탕으로 업종 추천 사유를 2~3문장으로 간결하게 써주세요.
+- 행정동: {region} ({gu_name})
+- 업종명: {row.get('업종명')}
+- 점포수: {row.get('점포수')}
+- 평균영업기간(년): {row.get('평균영업기간(년)')}
+- 3년 생존율(%): {row.get('3년 생존율(%)')}
+- 5년 생존율(%): {row.get('5년 생존율(%)')}
+- 2022~2024 평균매출(가능한 연도만): {row.get('2022_평균매출','')}, {row.get('2023_평균매출','')}, {row.get('2024_평균매출','')}
+가이드: 수치가 클수록 긍정적, 0 또는 결측은 언급하지 않아도 됨. 과장 표현 금지, 간단명료, 한국어.
+"""
+
+    models_try = [prefer_model, "models/gemini-1.5-flash-8b"]
+    for m in models_try:
+        try:
+            model = _genai_model(m)
+            if not model:
+                raise RuntimeError("LLM not configured")
+            resp = model.generate_content(prompt)
+            text = (resp.text or "").strip()
+            if not text:
+                raise RuntimeError("Empty LLM response")
+            _REASON_CACHE[key] = text; _save_reason_cache(_REASON_CACHE)
+            return text, m
+        except (ResourceExhausted, GoogleAPIError, Exception) as e:
+            msg = str(e)
+            if "429" in msg or isinstance(e, ResourceExhausted):
+                time.sleep(1.5)
+                try:
+                    model = _genai_model(m)
+                    if model:
+                        resp = model.generate_content(prompt)
+                        text = (resp.text or "").strip()
+                        if text:
+                            _REASON_CACHE[key] = text; _save_reason_cache(_REASON_CACHE)
+                            return text, f"{m}-retry"
+                except Exception:
+                    pass
+            continue
+
+    r = rule_based_reason(row)
+    _REASON_CACHE[key] = r; _save_reason_cache(_REASON_CACHE)
+    return r, "fallback-429"
+
+# ====== 핵심 추천 파이프라인 ======
+def run_industry_recommendation(region, gu_name):
+    """
+    입력: region(행정동명), gu_name(구명)
+    출력: back/cache/runtime/recommendation_industry.json 에 {region: [{category_large, category_small, reason}, ...]} 저장
+    """
+    engine = get_engine()
+
+    # (선택) 연결 확인
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print("✅ DB 연결 확인")
     except Exception as e:
-        print("❌ 연결 실패:", e)
+        print("❌ DB 연결 실패:", e)
 
+    def load_table(table_name: str) -> pd.DataFrame:
+        return pd.read_sql(f"SELECT * FROM {table_name}", engine)
 
-    # SQLAlchemy 엔진 생성
-    engine = create_engine(
-        f'mysql+pymysql://{user}:{password}@{host}:{port}/{database}',
-        connect_args={'charset':'utf8mb4'}
-    )
+    def load_or_cache(name, table):
+        os.makedirs("cache", exist_ok=True)
+        path = f"cache/{name}.feather"
+        if os.path.exists(path):
+            print(f"📂 캐시 불러옴: {name}")
+            return pd.read_feather(path)
+        df = load_table(table)
+        df.to_feather(path)
+        print(f"💾 캐시 저장: {name}")
+        return df
 
-    # 공통 유틸 함수
     def get_recent_quarters_by_category(df, group_cols=['category_small'], num_quarters=4):
+        if df.empty:
+            return df
         df_sorted = df.sort_values(by=group_cols + ['year', 'quarter'])
         return df_sorted.groupby(group_cols, group_keys=False).tail(num_quarters)
 
-    def load_table(table_name):
-        try:
-            return pd.read_sql(f"SELECT * FROM {table_name}", engine)
-        except Exception as e:
-            print(f"❌ [ERROR] 테이블 {table_name} 로딩 실패:", e)
-            # 롤백 강제 실행
-            engine.dispose()  # 현재 연결 완전히 초기화
-            raise e
-        
-    def query_table(table_name, extra_condition="", category_col=None, indicator_col='indicator', indicator_val=None):
-        use_region_code = 'region_code' in pd.read_sql(f"SHOW COLUMNS FROM {table_name}", engine)['Field'].values
-        conditions = []
+    # region_code 조회 (파라미터 바인딩)
+    dong_code_df = pd.read_sql(
+        "SELECT DISTINCT region_code FROM subcategory_avg_operating_period_stats WHERE region_name = %s LIMIT 1",
+        engine, params=(region,),
+    )
+    if dong_code_df.empty:
+        raise ValueError(f"region_code을 찾을 수 없습니다: {region}")
+    dong_code = dong_code_df.iloc[0]['region_code']
+    print(f"선택한 동 '{region}'의 지역 코드: {dong_code}")
 
-        if use_region_code:
-            conditions.append(f"region_code LIKE '{dong_code}%%'")
-        elif target_dong and category_col:
-            conditions.append(f"{category_col} = '{target_dong}'")
-        if indicator_val and indicator_col:
-            conditions.append(f"{indicator_col} = '{indicator_val}'")
-        if extra_condition:
-            conditions.append(extra_condition)
-
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
-        sql = f"SELECT * FROM {table_name} WHERE {where_clause} ORDER BY year, quarter"
-        return pd.read_sql(sql, engine)
-
-    def query_sales(table, service_code=None):
-        cond = f"region_name = '{target_dong}'"
-        if service_code:
-            cond += f" AND service_code = '{service_code}'"
-        sql = f"SELECT * FROM {table} WHERE {cond} ORDER BY service_code, zone_id, year, quarter"
-        df = pd.read_sql(sql, engine)
-        return df.drop_duplicates(subset=["region_name", "year", "quarter", "service_code", "monthly_sales"])
-
-    def add_region_service_names(df, zone_df, service_df, target_dong=None):
-        df['zone_id'] = df['zone_id'].astype(str)
-        zone_df['zone_id'] = zone_df['zone_id'].astype(str)
-
-        df = df.merge(zone_df, on='zone_id', how='left')
-        df = df.merge(service_df, on='service_code', how='left')
-        if target_dong:
-            df = df[df['region_name'] == target_dong]
-        return df
-
-    # 사용자 입력
-    target_gu = '{gu_name}'
-    target_dong = '{region}'
-
-    # 구/동 코드 조회
-    dong_query = f"SELECT DISTINCT region_code FROM subcategory_avg_operating_period_stats WHERE region_name = '{target_dong}' LIMIT 1"
-    dong_code = pd.read_sql(dong_query, engine).iloc[0]['region_code']
-    print(f"선택한 동 '{target_dong}'의 지역 코드: {dong_code}")
-
-    # 기본 테이블 불러오기
-    zone_df = load_table('zone_table')
-    zone_df['zone_id'] = zone_df['zone_id'].astype(str)
-    service_df = load_table('service_type')
-
-    # 지표 테이블 로딩 및 최근 4분기 필터링
+    # 지표 로드
     indicators = {
         'age': ('subcategory_avg_operating_period_stats', 'avg_operating_years_30'),
         'store': ('subcategory_store_count_stats', 'store_total'),
         'survive': ('subcategory_startup_survival', None),
         'openclose': ('subcategory_openclose_stats', None)
     }
+    raw_data = {k: load_or_cache(f"{k}_all_df", t) for k, (t, _) in indicators.items()}
+
+    def filter_by_region(df, region_name):
+        return df[df['region_name'] == region_name].reset_index(drop=True)
+
     filtered_data = {}
-    for key, (table, indicator) in indicators.items():
-        df = query_table(table, indicator_val=indicator)
+    for key, (_, indicator) in indicators.items():
+        df_region = filter_by_region(raw_data[key], region)
+        if indicator and 'indicator' in df_region.columns:
+            df_region = df_region[df_region['indicator'] == indicator]
         if key in ['age', 'store']:
-            filtered_data[key] = get_recent_quarters_by_category(df)[["category_small", "region_name", "region_code", "year", "quarter", "indicator", "value"]]
+            cols = ["category_small", "region_name", "region_code", "year", "quarter", "indicator", "value"]
+            filtered_data[key] = get_recent_quarters_by_category(df_region)[cols] if not df_region.empty else df_region
         elif key == 'survive':
-            filtered_data[key] = get_recent_quarters_by_category(df)[["category_small", "region_name", "region_code", "year", "quarter",
-                                                                      "survival_1yr", "survival_3yr", "survival_5yr"]]
+            cols = ["category_small", "region_name", "region_code", "year", "quarter",
+                    "survival_1yr", "survival_3yr", "survival_5yr"]
+            filtered_data[key] = get_recent_quarters_by_category(df_region)[cols] if not df_region.empty else df_region
         else:  # openclose
-            filtered_data[key] = df[["category_small", "region_name", "region_code", "year", "quarter",
-                                     "num_open", "num_close"]]
+            cols = ["category_small", "region_name", "region_code", "year", "quarter", "num_open", "num_close"]
+            filtered_data[key] = df_region[cols] if not df_region.empty else df_region
 
-    # 매출 관련 데이터 처리
-    years = [2022, 2023, 2024]
-    gender_sales = {}
-    gender_sales_test ={}
-    age_sales = {}
-    summary_sales = {}
-
-    for year in years:
-        st_ct_df = load_table(f"zone_store_count_{year}")
-        gender_df = load_table(f"sales_by_gender_age_{year}")
-        gender_known = gender_df[gender_df['gender'].isin(['여성', '남성'])]
-        gender_unknown = gender_df[~gender_df['gender'].isin(['여성', '남성'])]
-
-        gender_known = add_region_service_names(gender_known, zone_df, service_df, target_dong)
-        gender_unknown = add_region_service_names(gender_unknown, zone_df, service_df, target_dong)
-
-        #----gender
-        gender_sales[year] = gender_known[["region_name", "zone_id", "service_name", "service_code", "year", "quarter", "gender", "sales_amount"]] \
-            .sort_values(by=["service_name", "gender", "year", "quarter"]).reset_index(drop=True)
-
-        gender_sales[year] = gender_sales[year].merge(st_ct_df[['zone_id', 'service_code', 'year', 'quarter','count']],on=['zone_id', 'service_code', 'year', 'quarter'],how='inner')
-        gender_sales[year].loc[:, 'avg_sales_per_store'] = gender_sales[year]['sales_amount'] / gender_sales[year]['count']
-
-        gender_sales[year] = gender_sales[year][["region_name", "zone_id", "service_name", "service_code", "year", "quarter", "gender", "avg_sales_per_store","count"]] \
-            .sort_values(by=["service_name", "gender", "year", "quarter"]).reset_index(drop=True)
-
-        #----age-group
-        age_sales[year] = gender_unknown[["region_name", "zone_id", "service_name", "service_code", "year", "quarter", "age_group", "sales_amount"]] \
-            .sort_values(by=["service_name", "age_group", "year", "quarter"]).reset_index(drop=True)
-        
-        age_sales[year] = age_sales[year].merge(st_ct_df[['zone_id', 'service_code', 'year', 'quarter','count']],on=['zone_id', 'service_code', 'year', 'quarter'],how='inner')
-        age_sales[year].loc[:, 'avg_sales_per_store'] = age_sales[year]['sales_amount'] / age_sales[year]['count']
-
-        age_sales[year] = age_sales[year][["region_name", "zone_id", "service_name", "service_code", "year", "quarter", "age_group", "avg_sales_per_store","count"]] \
-            .sort_values(by=["service_name", "age_group", "year", "quarter"]).reset_index(drop=True)
-
-        #----summary
-        sales_df = query_sales(f"sales_summary_{year}")
-        summary_sales[year] = sales_df[["region_name", "service_name", "zone_id", "service_code", "year", "quarter", "monthly_sales"]]
-        summary_sales[year].loc[:, 'zone_id'] = summary_sales[year]['zone_id'].astype(str)
-
-        summary_sales[year] = summary_sales[year].merge(st_ct_df[['zone_id', 'service_code', 'year', 'quarter','count']],on=['zone_id', 'service_code', 'year', 'quarter'],how='inner')
-        summary_sales[year].loc[:, 'avg_sales_per_store'] = summary_sales[year]['monthly_sales'] / summary_sales[year]['count']
-
-        summary_sales[year] = summary_sales[year][["region_name", "zone_id", "service_name", "service_code", "year", "quarter", "avg_sales_per_store","count"]] \
-            .sort_values(by=["service_name", "year", "quarter"]).reset_index(drop=True)
-
-    # 출력 예시
-    for year in years:
-        print(f"\n📊 업종 성별 매출 점포 평균{year}\n", gender_sales[year])
-        print(f"\n📊 업종 연령대 매출 {year}\n", age_sales[year])
-        print(f"\n📊 업종 분기별 월매출{year}\n", summary_sales[year])
-
-
-    # 평균값 계산 함수
+    # 평균 계산 유틸
     def get_avg(df, group_col='category_small', val_col=None, rename_col=None):
+        if df.empty or (val_col not in df.columns):
+            return pd.DataFrame(columns=[group_col, 'region_name', rename_col or val_col])
         df[val_col] = pd.to_numeric(df[val_col], errors='coerce')
         df = df.dropna(subset=[val_col])
-        avg = df.groupby(group_col).agg({
-            val_col: 'mean',
-            'region_name': 'first'
-        }).round(2).reset_index()
+        avg = df.groupby(group_col).agg({val_col: 'mean', 'region_name': 'first'}).round(2).reset_index()
         if rename_col:
             avg = avg.rename(columns={val_col: rename_col})
         return avg
 
-    # 평균 계산
-    age_avg = get_avg(filtered_data['age'], val_col='value', rename_col='평균영업기간(년)')
+    age_avg   = get_avg(filtered_data['age'],   val_col='value', rename_col='평균영업기간(년)')
     store_avg = get_avg(filtered_data['store'], val_col='value', rename_col='점포수')
 
-    survive_avg = filtered_data['survive'].groupby('category_small').agg({
-        'survival_1yr': 'mean',
-        'survival_3yr': 'mean',
-        'survival_5yr': 'mean',
-        'region_name': 'first'
-    }).round(2).reset_index().rename(columns={
-        'survival_1yr': '1년 생존율(%)',
-        'survival_3yr': '3년 생존율(%)',
-        'survival_5yr': '5년 생존율(%)'
-    })
+    if not filtered_data['survive'].empty:
+        survive_avg = filtered_data['survive'].groupby('category_small').agg({
+            'survival_1yr': 'mean',
+            'survival_3yr': 'mean',
+            'survival_5yr': 'mean',
+            'region_name': 'first'
+        }).round(2).reset_index().rename(columns={
+            'survival_1yr': '1년 생존율(%)',
+            'survival_3yr': '3년 생존율(%)',
+            'survival_5yr': '5년 생존율(%)'
+        })
+    else:
+        survive_avg = pd.DataFrame(columns=['category_small','region_name','1년 생존율(%)','3년 생존율(%)','5년 생존율(%)'])
 
-    openclose_avg = filtered_data['openclose'].groupby('category_small').agg({
-        'num_open': 'mean',
-        'num_close': 'mean',
-        'region_name': 'first'
-    }).round(2).reset_index().rename(columns={
-        'num_open': '평균 개업수',
-        'num_close': '평균 폐업수'
-    })
+    if not filtered_data['openclose'].empty:
+        openclose_avg = filtered_data['openclose'].groupby('category_small').agg({
+            'num_open': 'mean',
+            'num_close': 'mean',
+            'region_name': 'first'
+        }).round(2).reset_index().rename(columns={
+            'num_open': '평균 개업수',
+            'num_close': '평균 폐업수'
+        })
+    else:
+        openclose_avg = pd.DataFrame(columns=['category_small','region_name','평균 개업수','평균 폐업수'])
 
-    # 병합
     dfs = [age_avg, store_avg, survive_avg, openclose_avg]
-    from functools import reduce
-    merged_df = reduce(lambda left, right: pd.merge(left, right, on=['category_small', 'region_name']), dfs)
+    merged_df = dfs[0]
+    for d in dfs[1:]:
+        merged_df = pd.merge(merged_df, d, on=['category_small','region_name'], how='outer')
 
-    # 컬럼 정리
-    merged_df = merged_df.rename(columns={
-        'category_small': '업종명',
-        'region_name': '행정동명'
-    }).sort_values(by='점포수', ascending=False).reset_index(drop=True)
+    merged_df = merged_df.rename(columns={'category_small':'업종명','region_name':'행정동명'})
+    merged_df[['평균영업기간(년)','점포수','1년 생존율(%)','3년 생존율(%)','5년 생존율(%)','평균 개업수','평균 폐업수']] = \
+        merged_df[['평균영업기간(년)','점포수','1년 생존율(%)','3년 생존율(%)','5년 생존율(%)','평균 개업수','평균 폐업수']].fillna(0)
 
-    # 출력
-    pd.set_option('display.float_format', '{:,.2f}'.format)
-    print("📊 종합 지역 상권 요약 리포트")
-    print(merged_df)
+    # === 매출 처리 ===
+    def add_region_service_names(df, zone_df, service_df, region=None):
+        if df.empty:
+            return df
+        df['zone_id'] = df['zone_id'].astype(str)
+        zone_df['zone_id'] = zone_df['zone_id'].astype(str)
+        df = df.merge(zone_df, on='zone_id', how='left', suffixes=('', '_zone'))
+        df = df.merge(service_df, on='service_code', how='left', suffixes=('', '_service'))
+        if 'region_name_zone' in df.columns:
+            df['region_name'] = df['region_name_zone']; df.drop(columns=['region_name_zone'], inplace=True)
+        elif 'region_name_service' in df.columns:
+            df['region_name'] = df['region_name_service']; df.drop(columns=['region_name_service'], inplace=True)
+        if region:
+            df = df[df['region_name'] == region]
+        # service_name 개행 정리
+        if 'service_name' in df.columns:
+            df['service_name'] = df['service_name'].astype(str).str.replace(r'[\r\n]+', '', regex=True)
+        return df
 
+    zone_df = load_table('zone_table')
+    service_df = load_table('service_type')
 
-    def get_avg_sales(sales_df, group_col):
+    def load_year(table_prefix, year):
+        return pd.read_sql(f"SELECT * FROM {table_prefix}_{year}", engine)
+
+    def preprocess_sales(year, region, table_name, filter_cols, group_cols=None):
+        df = load_year(table_name, year)
+        st_ct_df = load_year("zone_store_count", year)
+        df = add_region_service_names(df, zone_df, service_df, region)
+        if df.empty:
+            return df
+        df = df[filter_cols]
+        if group_cols is None:
+            group_cols = []
+        df = df.sort_values(by=group_cols + ['year','quarter']).reset_index(drop=True)
+        df = df.merge(st_ct_df[['zone_id','service_code','year','quarter','count']],
+                      on=['zone_id','service_code','year','quarter'], how='inner')
+        # 컬럼 자동 탐색
+        sales_col = [c for c in filter_cols if 'sales' in c or 'amount' in c][-1]
+        df['avg_sales_per_store'] = df[sales_col] / df['count']
+        return df[['region_name','zone_id','service_name','service_code','year','quarter','avg_sales_per_store','count']]
+
+    years = [2022, 2023, 2024]
+    summary_sales = {y: preprocess_sales(
+        y, region,
+        table_name='sales_summary',
+        filter_cols=["region_name","zone_id","service_name","service_code","year","quarter","monthly_sales"],
+        group_cols=["service_name"]
+    ) for y in years}
+
+    def get_avg_sales_sum(sales_df):
+        if sales_df.empty:
+            return pd.DataFrame(columns=['service_code','avg_sales_per_store','region_name','service_name'])
         sales_df['avg_sales_per_store'] = pd.to_numeric(sales_df['avg_sales_per_store'], errors='coerce')
         sales_df = sales_df.dropna(subset=['avg_sales_per_store'])
-        
-        avg_df = sales_df.groupby(['service_code', group_col]).agg({
+        avg_df = sales_df.groupby(['service_code']).agg({
             'avg_sales_per_store': 'mean',
             'region_name': 'first',
             'service_name': 'first'
-        }).round(2).reset_index()
-
+        }).reset_index()
         avg_df['avg_sales_per_store'] = (avg_df['avg_sales_per_store'] / 3).round(2)
-
         return avg_df
 
-    def get_avg_sales_sum(sales_df, group_col=None):
-        # 매출 데이터를 숫자로 변환, 결측치 제거
-        sales_df['avg_sales_per_store'] = pd.to_numeric(sales_df['avg_sales_per_store'], errors='coerce')
-        sales_df = sales_df.dropna(subset=['avg_sales_per_store'])
-
-        # 기본 그룹핑 컬럼: 업종 코드
-        group_cols = ['service_code']
-        #if group_col:
-        #    group_cols.append(group_col)  # 추가 그룹핑 컬럼 (예: 지역코드 등)
-
-        # 그룹별 평균 매출 계산
-        avg_df = sales_df.groupby(group_cols).agg({
-            'avg_sales_per_store': 'mean',     # 분기별 평균 매출
-            'region_name': 'first',            # 대표 지역명 (group_col이 지역일 경우)
-            'service_name': 'first'            # 업종명
-        })
-
-        # 분기 매출 → 월평균 매출로 환산
-        avg_df['avg_sales_per_store'] = (avg_df['avg_sales_per_store'] / 3).round(2)
-
-        return avg_df
-
-
-    # 결과 저장 리스트
-    gender_list = []
-    age_list = []
     summary_list = []
+    for y in years:
+        df = get_avg_sales_sum(summary_sales[y])
+        df['year'] = y
+        summary_list.append(df)
+    summary_df = pd.concat(summary_list, ignore_index=True) if summary_list else pd.DataFrame()
 
-    for year in years:
-        # 성별별 평균
-        gender_avg_df = get_avg_sales(gender_sales[year], group_col='gender')
-        gender_avg_df['year'] = year
-        gender_list.append(gender_avg_df)
+    if not summary_df.empty:
+        summary_df.rename(columns={
+            'region_name':'행정동명','service_name':'업종명','service_code':'업종코드',
+            'avg_sales_per_store':'평균 월 매출'
+        }, inplace=True)
+        pivot_summary = summary_df.pivot_table(
+            index=['행정동명','업종명'], columns='year', values='평균 월 매출', aggfunc='mean'
+        ).reset_index()
+        pivot_summary.columns.name = None
+        pivot_summary.rename(columns={2022:'2022_평균매출', 2023:'2023_평균매출', 2024:'2024_평균매출'}, inplace=True)
+        merged_df = merged_df.merge(pivot_summary, on=['업종명','행정동명'], how='left')
+    else:
+        for c in ['2022_평균매출','2023_평균매출','2024_평균매출']:
+            merged_df[c] = 0.0
 
-        # 연령대별 평균
-        age_avg_df = get_avg_sales(age_sales[year], group_col='age_group')
-        age_avg_df['year'] = year
-        age_list.append(age_avg_df)
+    for c in ['2022_평균매출','2023_평균매출','2024_평균매출']:
+        if c not in merged_df.columns:
+            merged_df[c] = 0.0
+        merged_df[c] = pd.to_numeric(merged_df[c], errors='coerce').fillna(0.0)
 
-        # 전체 업종 평균
-        summary_avg_df = get_avg_sales_sum(summary_sales[year], group_col='service_code')
-        summary_avg_df['year'] = year
-        summary_list.append(summary_avg_df)
-
-    # 데이터프레임으로 합치기
-    gender_df = pd.concat(gender_list).reset_index(drop=True)
-    age_df = pd.concat(age_list).reset_index(drop=True)
-    summary_df = pd.concat(summary_list).reset_index(drop=True)
-
-    # 컬럼명 정리
-    gender_df.rename(columns={
-        'region_name': '행정동명',
-        'service_name': '업종명',
-        'service_code': '업종코드',
-        'gender': '성별',
-        'avg_sales_per_store': '성별별 평균 월 매출'
-    }, inplace=True)
-
-    age_df.rename(columns={
-        'region_name': '행정동명',
-        'service_name': '업종명',
-        'service_code': '업종코드',
-        'age_group': '연령대',
-        'avg_sales_per_store': '연령대별 평균 월 매출'
-    }, inplace=True)
-
-    summary_df.rename(columns={
-        'region_name': '행정동명',
-        'service_name': '업종명',
-        'service_code': '업종코드',
-        'avg_sales_per_store': '평균 월 매출'
-    }, inplace=True)
-
-    gender_df.to_json('gender_avg_sales_industry.json', orient='records', force_ascii=False, indent=4)
-    age_df.to_json('age_avg_sales_industry.json', orient='records', force_ascii=False, indent=4)
-    summary_df.to_json('summary_avg_sales_industry.json', orient='records', force_ascii=False, indent=4)
-
-    # JSON 문자열 변수에 저장
-    gender_industry_json = gender_df.to_json(orient='records', force_ascii=False, indent=4)
-    age_industry_json = age_df.to_json(orient='records', force_ascii=False, indent=4)
-    summary_industry_json = summary_df.to_json(orient='records', force_ascii=False, indent=4)
-
-    # ------------------------
-    # 정규화 대상 컬럼 정의
-    # ------------------------
+    # ===== 스코어링 =====
     score_columns = [
-        '평균영업기간(년)', '점포수',
-        '1년 생존율(%)', '3년 생존율(%)', '5년 생존율(%)',
-        '평균 개업수', '평균 폐업수'
+        '평균영업기간(년)','점포수','1년 생존율(%)','3년 생존율(%)','5년 생존율(%)','평균 개업수','평균 폐업수',
+        '2022_평균매출','2023_평균매출','2024_평균매출'
     ]
-    score_columns_2 = ['2022_평균매출', '2023_평균매출', '2024_평균매출']
-
-    # ------------------------
-    # 가중치 정의 (수정 가능)
-    # ------------------------
     weights = {
-        '평균영업기간(년)': 0.05,
-        '점포수': 0.15,
-        '1년 생존율(%)': 0.05,
-        '3년 생존율(%)': 0.07,
-        '5년 생존율(%)': 0.10,
-        '평균 개업수': 0.04,
-        '평균 폐업수': -0.04,
-        '2022_평균매출': 0.15,
-        '2023_평균매출': 0.17,
-        '2024_평균매출': 0.22
+        '평균영업기간(년)': 0.05, '점포수': 0.15, '1년 생존율(%)': 0.05, '3년 생존율(%)': 0.07,
+        '5년 생존율(%)': 0.10, '평균 개업수': 0.04, '평균 폐업수': -0.04,
+        '2022_평균매출': 0.15, '2023_평균매출': 0.17, '2024_평균매출': 0.22
     }
 
-    # ------------------------
-    # 정규화 수행
-    # ------------------------
-    # summary_df에서 연도별 평균 매출 피벗 (업종/행정동 기준으로 wide format 만들기)
-    pivot_summary = summary_df.pivot_table(
-        index=['행정동명', '업종명'],
-        columns='year',
-        values='평균 월 매출',
-        aggfunc='mean'
-    ).reset_index()
-
-    # 컬럼명 정리 (2022, 2023, 2024 → '2022_평균매출' 형태로)
-    pivot_summary.columns.name = None
-    pivot_summary.rename(columns={
-        2022: '2022_평균매출',
-        2023: '2023_평균매출',
-        2024: '2024_평균매출'
-    }, inplace=True)
-
-    # merged_df에 평균 매출 병합
-    merged_df = merged_df.merge(pivot_summary, on=['업종명','행정동명'], how='left')
-    merged_df.to_json('merged_industry.json', orient='records', force_ascii=False, indent=4)
-
-    # JSON 문자열 변수에 저장
-    merged_industry_json = merged_df.to_json(orient='records', force_ascii=False, indent=4)
-
-    # 정규화 대상 컬럼
-    all_score_columns = score_columns + score_columns_2
-
-    # 정규화 수행
-    clean_df = merged_df[all_score_columns].replace([np.inf, -np.inf], np.nan).fillna(0)
-
+    clean_df = merged_df[score_columns].replace([np.inf,-np.inf], np.nan).fillna(0)
     scaler = MinMaxScaler()
     normalized = scaler.fit_transform(clean_df)
-    normalized_df = pd.DataFrame(normalized, columns=[f'norm_{col}' for col in all_score_columns])
-    # 병합
+    normalized_df = pd.DataFrame(normalized, columns=[f"norm_{c}" for c in score_columns])
     merged_with_norm = pd.concat([merged_df, normalized_df], axis=1)
 
-    # 점수 계산
-    merged_with_norm['업종_추천점수'] = sum(
-        merged_with_norm[f'norm_{col}'] * weight
-        for col, weight in weights.items()
+    merged_with_norm['업종_추천점수'] = 0.0
+    for col, w in weights.items():
+        merged_with_norm['업종_추천점수'] += merged_with_norm[f"norm_{col}"] * w
+
+    final_result = merged_with_norm.drop(columns=[f"norm_{c}" for c in score_columns]).sort_values(
+        by='업종_추천점수', ascending=False
+    ).reset_index(drop=True)
+
+    print("📊 종합 지역 상권 요약 리포트")
+    print(merged_df)
+    print("🏆 최종 업종 추천 결과 (지역+업종 기준)")
+    print(final_result[['행정동명','업종명','업종_추천점수']].head(10))
+
+    # ===== 상위 TOPK에 대해 이유 생성 =====
+    subcategory_df = pd.read_sql(
+        "SELECT DISTINCT category_large, category_small FROM subcategory_store_count_stats", engine
     )
 
-    # 불필요한 정규화 컬럼 제거, 정렬
-    norm_cols = [f'norm_{col}' for col in all_score_columns]
-    final_result = merged_with_norm.drop(columns=norm_cols).sort_values(by='업종_추천점수', ascending=False).reset_index(drop=True)
-    final_result = final_result.replace([np.inf, -np.inf], np.nan)
-    final_result = final_result.dropna(subset=['2022_평균매출', '2023_평균매출', '2024_평균매출'])
+    recommendations = []
+    for _, row in final_result.head(TOPK_FOR_REASON).iterrows():
+        label = (row.get('업종명') or '').strip().replace('\r','')
+        large_label = '기타'
+        mr = subcategory_df[subcategory_df['category_small'] == label]
+        if not mr.empty:
+            large_label = mr.iloc[0]['category_large']
 
-    # 저장
-    final_result.to_csv('filtered_result_industry.csv', index=False, encoding='utf-8-sig')
-    final_result.to_json('filtered_result_industry.json', orient='records', force_ascii=False, indent=4)
-    filtered_result_industry_json = final_result.to_json(orient='records', force_ascii=False, indent=4)
-
-    # 출력
-    print("🏆 최종 업종 추천 결과 (지역+업종 기준)")
-    print(final_result[['행정동명', '업종명', '업종_추천점수']].head(10))
-
-    #----LLM----
-    # API 키 설정
-    genai.configure(api_key="AIzaSyCiEbjep2f6PRLqTr1JKYE2vMlbrAHvr-E")
-
-    # 모델 선택
-    model = genai.GenerativeModel(model_name="models/gemini-2.5-flash")
-    def generate_business_summary(row, target_dong):
-        업종명 = row['업종명']
-        행정동명 = row['행정동명']
-
-        few_shot_examples ="""
-    [예시 1]
-    - 업종명: 커피 전문점
-    - 평균영업기간: 4.2년
-    - 점포수: 180개
-    - 3년 생존율: 72%
-    - 5년 생존율: 55%
-    - 평균 개업수: 14개
-    - 평균 폐업수: 8개
-    - 2022 평균 월매출: 8,400,000원
-    - 2023 평균 월매출: 8,800,000원
-    - 2024 평균 월매출: 9,200,000원
-
-    꾸준한 매출 상승과 높은 생존율이 돋보이며, 창업에 안정적인 업종으로 평가됩니다.
-
-    [예시 2]
-    - 업종명: 분식 전문점
-    - 평균영업기간: 3.6년
-    - 점포수: 90개
-    - 3년 생존율: 69%
-    - 5년 생존율: 51%
-    - 평균 개업수: 12개
-    - 평균 폐업수: 6개
-    - 2022 평균 월매출: 6,100,000원
-    - 2023 평균 월매출: 6,400,000원
-    - 2024 평균 월매출: 6,900,000원
-
-    매출이 지속적으로 증가하고 있으며, 비교적 낮은 폐업률로 안정적인 창업이 가능합니다.
-    """
-
-        # 프롬프트 완성
-        prompt = f"""
-    당신은 업종 추천 전문가입니다.
-    아래는 '{target_dong}' 지역에서 '{업종명}' 업종을 '{행정동명}' 내에 창업했을 때의 주요 지표입니다:
-
-    먼저 참고용 예시를 확인하세요:
-    {few_shot_examples}
-
-    ---
-
-    이제 아래 지표를 바탕으로 업종 추천 사유를 긍정적으로 **3줄 이내로 작성**해 주세요:
-
-
-    - 평균영업기간: {row['평균영업기간(년)']}년
-    - 점포수: {row['점포수']}개
-    - 3년 생존율: {row['3년 생존율(%)']}%
-    - 5년 생존율: {row['5년 생존율(%)']}%
-    - 평균 개업수: {row['평균 개업수']}개
-    - 평균 폐업수: {row['평균 폐업수']}개
-    - 2022 평균 월매출: {int(row['2022_평균매출']):,}원
-    - 2023 평균 월매출: {int(row['2023_평균매출']):,}원
-    - 2024 평균 월매출: {int(row['2024_평균매출']):,}원
-
-    """
-        response = model.generate_content(prompt)
-        return response.text.strip()
-
-    # ----추천 결과 생성----
-    recommendation_list = []
-
-    subcategory_df = pd.read_sql("SELECT DISTINCT category_large, category_small FROM subcategory_store_count_stats", engine)
-
-    # 상위 5개만 추출
-    top_n = 5
-
-    for idx, row in final_result.head(top_n).iterrows():
-        label = row['업종명']
-
-        # 대분류(category_large) 찾기
-        match_row = subcategory_df[subcategory_df['category_small'] == label]
-        if not match_row.empty:
-            large_label = match_row.iloc[0]['category_large']
-        else:
-            large_label = '기타'  # 혹은 None 등 기본값 설정
-
-        reason = generate_business_summary(row, target_dong)
-        recommendation_list.append({
+        reason, src = generate_reason_with_llm(gu_name, region, row)
+        recommendations.append({
             'category_large': large_label,
             'category_small': label,
             'reason': reason
         })
 
-    # ----JSON 저장----
-    recommendation_dict = {
-        target_dong: recommendation_list
-    }
+    # ===== JSON 저장 (reloader 감시 밖 경로) =====
+    runtime_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'cache', 'runtime'))
+    os.makedirs(runtime_dir, exist_ok=True)
+    out_path = os.path.join(runtime_dir, 'recommendation_industry.json')
 
-    # JSON 파일로 저장
-    with open('recommendation_industry.json', 'w', encoding='utf-8') as f:
-        json.dump(recommendation_dict, f, ensure_ascii=False, indent=4)
+    payload = { region: recommendations }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=4)
 
-    # JSON 문자열로 변수에 저장
-    recommendation_industry_json = json.dumps(recommendation_dict, ensure_ascii=False, indent=4)
-
-    # 출력
-    print(recommendation_industry_json)
+    print(json.dumps(payload, ensure_ascii=False, indent=4))
+    return payload

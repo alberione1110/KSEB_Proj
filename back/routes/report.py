@@ -1,119 +1,171 @@
-# routes/report.py
-
-from flask import Blueprint, request, jsonify
-from flask_cors import CORS
-import pandas as pd
-import json
-import os
 import re
-from sqlalchemy import create_engine
-import pymysql
-import sys
+import pandas as pd
+from flask import Blueprint, request, jsonify
 
-# 🔧 ai 코드 경로 추가
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../ai')))
-from ai.report_ai import run_report
+from config.settings import get_engine  # ✅ 환경변수에서 안전하게 로드
+from ai.report_ai import generate_report
 
-bp = Blueprint('report', __name__)
-CORS(bp)
+bp = Blueprint("report", __name__)
 
-# ✅ RDS 접속 정보
-DB_USER = 'oesnue'
-DB_PASSWORD = 'gPwls0105!'
-DB_HOST = 'daktor-commercial-prod.czig88k8s0e8.ap-northeast-2.rds.amazonaws.com'
-DB_PORT = 3306
-DB_NAME = 'daktor_db'
+def _pick_params():
+    """1) JSON body 우선, 없으면 2) 쿼리스트링에서 가져오는 헬퍼"""
+    data = request.get_json(silent=True) or {}
+    region = (data.get("region") or request.args.get("region") or "").strip()
+    gu_name = (data.get("gu_name") or request.args.get("gu_name") or "").strip()
+    category_small = (data.get("category_small") or request.args.get("category_small") or "").strip()
+    purpose = (data.get("purpose") or request.args.get("purpose") or "").strip()
+    category_large = (data.get("category_large") or request.args.get("category_large") or "").strip()
+    role = (data.get("role") or request.args.get("role") or "").strip()
+    return {
+        "region": region,
+        "gu_name": gu_name,
+        "category_small": category_small,
+        "purpose": purpose,
+        "category_large": category_large,
+        "role": role,
+    }
 
-engine = create_engine(
-    f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
-    connect_args={'charset': 'utf8mb4'}
-)
+# ✅ '구 동'으로 들어와도 '동'만 뽑아 쓰도록 정규화
+def _dong_only(name: str, gu: str) -> str:
+    if not name:
+        return ''
+    n = re.sub(r'^\s*(서울특별시|서울시)\s*', '', name)
+    if gu:
+        n = re.sub(rf'^\s*{re.escape(gu)}\s*', '', n)
+    return n.strip()
 
-# 🔧 CSV 경로
-REGION_CSV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/region_info.csv'))
-SERVICE_CSV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/service_type.csv'))
+# --- 섹션 파서 유틸 ---
+SECTION_TITLE_MAP = {
+    1: "1. 기본 지역 정보",
+    2: "2. 상권 변화",
+    3: "3. 신생 기업 생존율 및 평균 영업 기간",
+    4: "4. 개폐업 추이 및 진입 위험도",
+    5: "5. 인구 및 유동 인구 특성",
+    6: "6. 임대료 수준",
+    7: "7. 매출 특성 요약",
+}
 
-@bp.route('/report', methods=['POST'])
+def _parse_sections(text: str):
+    """LLM이 만든 보고서 문자열을 프론트가 기대하는 sections 배열로 변환"""
+    if not isinstance(text, str) or not text.strip():
+        return []
+
+    # 1) 마크다운/불릿 정리
+    t = re.sub(r'^\s*[-*•]\s*', '', text, flags=re.MULTILINE)
+    # '1.\n제목' → '1. 제목'
+    t = re.sub(r'(?m)^\s*(\d+)\.\s*\n\s*', r'\1. ', t)
+
+    # 2) '👉 종합 평가' 또는 '숫자. ' 단위로 분리
+    parts = re.split(r'(?m)(?=^👉\s*종합\s*평가|^\d+\.\s)', t.strip())
+
+    sections = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        lines = p.splitlines()
+        title = lines[0].strip()
+
+        # '1.' 처럼 숫자만 있는 제목 보정
+        m = re.match(r'^(\d+)\.\s*$', title)
+        if m:
+            idx = int(m.group(1))
+            title = SECTION_TITLE_MAP.get(idx, title)
+
+        body = "\n".join(lines[1:]).strip()
+        sections.append({"title": title, "content": body})
+
+    # 3) '👉 종합 평가'가 있으면 맨 앞으로 이동
+    eval_idx = next((i for i, s in enumerate(sections) if "종합 평가" in s["title"]), None)
+    if eval_idx not in (None, 0):
+        sections = [sections[eval_idx]] + sections[:eval_idx] + sections[eval_idx+1:]
+
+    # 4) 종합 평가가 전혀 없으면 첫 문단으로 요약 생성해 앞에 추가
+    if eval_idx is None:
+        first_para = parts[0].split("\n\n")[0].strip() if parts else ""
+        sections = [{"title": "👉 종합 평가", "content": first_para}] + sections
+
+    return sections
+
+@bp.route("/report", methods=["GET", "POST"])
 def report():
     try:
-        data = request.get_json()
-        print("[Report] 받은 데이터:", data)
+        params = _pick_params()
+        print("📥 /api/report params =", params)
 
-        gu_name = data.get('gu_name')
-        region = data.get('region')
-        category_large = data.get('category_large')
-        category_small = data.get('category_small')
-        purpose = data.get('purpose')
-        years = data.get('years', ['2024'])  # 리스트 형태로 받거나 기본값
+        missing = [k for k in ["region", "gu_name", "category_small", "purpose"] if not params[k]]
+        if missing:
+            return jsonify({
+                "ok": False,
+                "error": "missing_required_params",
+                "missing": missing,
+                "hint": "예: ?region=연남동&gu_name=마포구&category_small=한식음식점&purpose=창업 준비",
+            }), 400
 
-        # 지역코드 매핑
-        region_df = pd.read_csv(REGION_CSV_PATH)
-        matched_region = region_df[region_df['region_name'].str.contains(region)]
-        if matched_region.empty:
-            return jsonify({"error": f"지역 '{region}'에 해당하는 지역코드가 없습니다."}), 400
-        region_code = matched_region.iloc[0]['region_code']
+        # 입력 region 정규화: '마포구 연남동' -> '연남동'
+        region_only = _dong_only(params["region"], params["gu_name"])
 
-        # 업종코드 매핑
-        service_df = pd.read_csv(SERVICE_CSV_PATH)
-        matched_service = service_df[service_df['service_name'].str.contains(category_small)]
-        if matched_service.empty:
-            return jsonify({"error": f"업종 '{category_small}'에 해당하는 서비스코드가 없습니다."}), 400
-        service_code = matched_service.iloc[0]['service_code']
+        engine = get_engine()  # ✅ 안전한 엔진 로드
 
-        # ✅ RDS에서 zone_id 조회
-        zone_query = f"""
-        SELECT zone_id FROM zone_table WHERE region_name LIKE '%{region}%'
-        """
-        zone_ids_df = pd.read_sql_query(zone_query, engine)
-        zone_ids = zone_ids_df['zone_id'].tolist()
+        # 1) category_large
+        large_df = pd.read_sql_query(
+            "SELECT category_large FROM subcategory_avg_operating_period_stats WHERE category_small = %s LIMIT 1",
+            engine, params=(params["category_small"],)
+        )
+        if large_df.empty:
+            return jsonify({"ok": False, "error": "not_found", "detail": "category_large를 찾을 수 없음"}), 404
+        category_large = large_df["category_large"].iloc[0]
+
+        # 2) service_code
+        code_df = pd.read_sql_query(
+            "SELECT service_code FROM service_type WHERE service_name LIKE %s LIMIT 1",
+            engine, params=(f"%{params['category_small']}%",)
+        )
+        if code_df.empty:
+            return jsonify({"ok": False, "error": "not_found", "detail": "service_code를 찾을 수 없음"}), 404
+        service_code = code_df["service_code"].iloc[0]
+
+        # 3) region_code  ← 여기서부터 region_only 사용
+        region_df = pd.read_sql_query(
+            "SELECT region_code FROM avg_operating_period_stats WHERE region_name = %s LIMIT 1",
+            engine, params=(region_only,)
+        )
+        if region_df.empty:
+            return jsonify({"ok": False, "error": "not_found", "detail": "region_code를 찾을 수 없음"}), 404
+        region_code = region_df["region_code"].iloc[0]
+
+        # 4) zone_ids
+        zone_ids_df = pd.read_sql_query(
+            "SELECT zone_id FROM zone_table WHERE region_name = %s",
+            engine, params=(region_only,)
+        )
+        zone_ids = zone_ids_df["zone_id"].astype(str).tolist()
         if not zone_ids:
-            return jsonify({"error": f"{region}에 해당하는 zone_id가 없습니다."}), 404
+            return jsonify({"ok": False, "error": "not_found", "detail": "zone_id가 없음"}), 404
 
-        print(f"[Report] region_code: {region_code}, service_code: {service_code}, zone_ids: {zone_ids}")
-
-        # ✅ AI 보고서 생성
-        run_report(
-            gu_name,
-            region,
-            category_large,
-            category_small,
-            purpose,
-            region_code,
-            service_code,
-            years
+        # 리포트 생성 (텍스트/차트/존 설명)
+        report_text, chart_data, zone_ids_str, zone_texts = generate_report(
+            gu_name=params["gu_name"],
+            region=region_only,
+            category_large=category_large,
+            category_small=params["category_small"],
+            purpose=params["purpose"],
+            region_code=region_code,
+            service_code=service_code,
+            zone_ids=zone_ids,
         )
 
-        # report.txt 파싱
-        with open("report.txt", "r", encoding="utf-8") as f:
-            report_text = f.read()
+        sections = _parse_sections(report_text)
 
-        sections = re.split(r"(?=\n?\d+\.\s|👉)", report_text.strip())
-        parsed_sections = []
-        for section in sections:
-            lines = section.strip().split("\n", 1)
-            if len(lines) == 2:
-                title = lines[0].strip()
-                content = lines[1].strip()
-            else:
-                title = lines[0].strip()
-                content = ""
-            parsed_sections.append({"title": title, "content": content})
-
-        # chart_data.json 로딩
-        if os.path.exists("chart_data.json"):
-            with open("chart_data.json", "r", encoding="utf-8") as f:
-                chart_data = json.load(f)
-        else:
-            chart_data = {}
-
-        # ✅ JSON 응답
         return jsonify({
-            "summary": report_text[:300],  # 요약
-            "sections": parsed_sections,
+            "ok": True,
+            "summary": f"{params['gu_name']} {region_only} · {params['category_small']} · {params['purpose']}",
+            "sections": sections,
             "chart_data": chart_data,
-            "zone_ids": zone_ids
+            "zone_ids": [str(z) for z in zone_ids],
+            "zone_texts": zone_texts,
+            "report_text": report_text,
         })
-
     except Exception as e:
-        print("[Error] 리포트 생성 중 오류:", str(e))
-        return jsonify({"error": "리포트 생성 실패"}), 500
+        print("❌ /api/report error:", e)
+        return jsonify({"ok": False, "error": "internal_error", "detail": str(e)}), 500

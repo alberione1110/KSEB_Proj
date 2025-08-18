@@ -1,411 +1,372 @@
-from openai import OpenAI
+# ai/report_ai.py
 import os
 import re
-import pandas as pd
-from sqlalchemy import create_engine
-import pymysql
 import json
+import pandas as pd
+from sqlalchemy import text
+from openai import OpenAI
+from config.settings import get_engine  # ✅ 공용 DB 엔진(.env 기반)
 
-def run_report (gu_name, region, category_large, category_small, purpose, region_code, service_code, years):
-    client = OpenAI(api_key="")  
+# =======================
+# 환경 변수 (반드시 설정)
+# =======================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ⛔ 하드코딩 제거
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY 가 설정되어 있지 않습니다 (.env 확인).")
 
-    host = 'daktor-commercial-prod.czig88k8s0e8.ap-northeast-2.rds.amazonaws.com'
-    port = 3306
-    user = 'oesnue'
-    password = 'gPwls0105!'
-    database = 'daktor_db'
+client = OpenAI(api_key=OPENAI_API_KEY)
+engine = get_engine()
 
-    engine = create_engine(
-        f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}",
-        connect_args={'charset': 'utf8mb4'}
+
+def _safe_first(df, col, default=0):
+    if not df.empty and col in df.columns and pd.notnull(df[col].iloc[0]):
+        return df[col].iloc[0]
+    return default
+
+
+def generate_report(gu_name, region, category_large, category_small, purpose, region_code, service_code, zone_ids):
+    """
+    리포트 텍스트/차트데이터/존 요약을 '반환'하는 함수 (파일 저장 X)
+    return: (report_text:str, chart_data:dict, zone_ids:[str], zone_texts:dict[str,str])
+    """
+    years = [2022, 2023, 2024, 2025]
+
+    # ---- DB 연결 점검(로그) ----
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception as e:
+        print("❌ DB 연결 실패:", e)
+
+    # ---- 기본 집계 (파라미터 바인딩) ----
+    # MySQL에서는 IN (%s, %s, ...) 형태로 플레이스홀더 구성 필요
+    years_placeholders = ",".join(["%s"] * len(years))
+
+    open_close_df = pd.read_sql_query(
+        f"""
+        SELECT year, num_open, num_close
+        FROM openclose_stats
+        WHERE region_name = %s AND region_code = %s
+          AND year IN ({years_placeholders})
+        ORDER BY year
+        """,
+        engine,
+        params=tuple([region, region_code] + years),
     )
 
-    # 연결 시도
-    try:
-        conn = pymysql.connect(
-            host=host,
-            user=user,
-            password=password,
-            database=database,
-            port=port,
-            connect_timeout=5
-        )
-        print("✅ RDS 연결 성공")
+    survival_df = pd.read_sql_query(
+        """
+        SELECT 
+            ROUND(AVG(survival_rate_1yr), 1) AS avg_survival_rate_1yr,
+            ROUND(AVG(survival_rate_3yr), 1) AS avg_survival_rate_3yr,
+            ROUND(AVG(survival_rate_5yr), 1) AS avg_survival_rate_5yr
+        FROM startup_survival_rate
+        WHERE region_name = %s AND region_code = %s
+          AND year BETWEEN %s AND %s
+          AND quarter IN (1,2,3,4)
+        """,
+        engine,
+        params=(region, region_code, 2022, 2025),
+    )
 
-        # 간단한 쿼리 테스트
-        with conn.cursor() as cursor:
-            cursor.execute("SHOW TABLES;")
-            for row in cursor.fetchall():
-                print(row)
+    rent_df = pd.read_sql_query(
+        """
+        SELECT 
+            ROUND(AVG(rent_first_floor)) AS avg_rent_first_floor,
+            ROUND(AVG(rent_other_floors)) AS avg_rent_other_floors
+        FROM rental_price_stats
+        WHERE region_name = %s AND region_code = %s
+          AND year BETWEEN %s AND %s
+          AND quarter IN (1,2,3,4)
+        """,
+        engine,
+        params=(region, region_code, 2022, 2025),
+    )
 
-        conn.close()
+    store_df = pd.read_sql_query(
+        f"""
+        SELECT year, store_total, store_franchise, store_nonfranchise
+        FROM store_count_stats
+        WHERE region_name = %s AND region_code = %s
+          AND year IN ({years_placeholders})
+        ORDER BY year
+        """,
+        engine,
+        params=tuple([region, region_code] + years),
+    )
 
-    except Exception as e:
-        print("❌ 연결 실패:", e)
+    avg_years_df = pd.read_sql_query(
+        """
+        SELECT ROUND(AVG(value), 1) AS avg_10yr
+        FROM subcategory_avg_operating_period_stats
+        WHERE region_name = %s AND region_code = %s
+          AND category_large = %s AND category_small = %s
+          AND indicator = 'avg_operating_years_10'
+          AND year BETWEEN %s AND %s AND quarter IN (1,2,3,4)
+        """,
+        engine,
+        params=(region, region_code, category_large, category_small, 2022, 2025),
+    )
 
-    print("1. DB 연결 및 쿼리 시작")
+    avg_years_df2 = pd.read_sql_query(
+        """
+        SELECT ROUND(AVG(value), 1) AS avg_30yr
+        FROM subcategory_avg_operating_period_stats
+        WHERE region_name = %s AND region_code = %s
+          AND category_large = %s AND category_small = %s
+          AND indicator = 'avg_operating_years_30'
+          AND year BETWEEN %s AND %s AND quarter IN (1,2,3,4)
+        """,
+        engine,
+        params=(region, region_code, category_large, category_small, 2022, 2025),
+    )
 
-    # ✅ 개폐업수: 연도별 데이터 사용 (3년치 평균 아님, 그대로 둠)
-    open_close_df = pd.read_sql_query(f"""
-    SELECT year, num_open, num_close
-    FROM openclose_stats
-    WHERE region_name = '{region}' AND region_code = {region_code}
-    AND year IN ({','.join(map(str, years))})
-    ORDER BY year
-    """, engine)
-
-    # ✅ 신생기업 생존율: 분기 데이터 평균 사용
-    survival_df = pd.read_sql_query(f"""
-    SELECT 
-        ROUND(AVG(survival_rate_1yr), 1) AS avg_survival_rate_1yr,
-        ROUND(AVG(survival_rate_3yr), 1) AS avg_survival_rate_3yr,
-        ROUND(AVG(survival_rate_5yr), 1) AS avg_survival_rate_5yr
-    FROM startup_survival_rate
-    WHERE region_name = '{region}' AND region_code = {region_code}
-    AND year BETWEEN 2022 AND 2025
-    AND quarter IN (1, 2, 3, 4)
-    """, engine)
-
-    # ✅ 임대시세: 분기 데이터 평균
-    rent_df = pd.read_sql_query(f"""
-    SELECT 
-        ROUND(AVG(rent_first_floor)) AS avg_rent_first_floor,
-        ROUND(AVG(rent_other_floors)) AS avg_rent_other_floors
-    FROM rental_price_stats
-    WHERE region_name = '{region}' AND region_code = {region_code}
-    AND year BETWEEN 2022 AND 2025
-    AND quarter IN (1, 2, 3, 4)
-    """, engine)
-
-    # ✅ 점포 수: 연도별 변화 추이 비교 (2023, 2024, 2025)
-    store_df = pd.read_sql_query(f"""
-    SELECT year, store_total, store_franchise, store_nonfranchise
-    FROM store_count_stats
-    WHERE region_name = '{region}' AND region_code = {region_code}
-    AND year IN ({','.join(map(str, years))})
-    ORDER BY year
-    """, engine)
-
-    # ✅ 평균 영업 기간: 연도·분기별 데이터 평균
-    avg_years_df = pd.read_sql_query(f"""
-    SELECT 
-        ROUND(AVG(value), 1) AS avg_10yr
-    FROM subcategory_avg_operating_period_stats
-    WHERE region_name = '{region}' AND region_code = {region_code}
-    AND category_large = '{category_large}' AND category_small = '{category_small}'
-    AND indicator = 'avg_operating_years_10'
-    AND year BETWEEN 2022 AND 2025
-    AND quarter IN (1, 2, 3, 4)
-    """, engine)
-
-    avg_years_df2 = pd.read_sql_query(f"""
-    SELECT 
-        ROUND(AVG(value), 1) AS avg_30yr
-    FROM subcategory_avg_operating_period_stats
-    WHERE region_name = '{region}' AND region_code = {region_code}
-    AND category_large = '{category_large}' AND category_small = '{category_small}'
-    AND indicator = 'avg_operating_years_30'
-    AND year BETWEEN 2022 AND 2025
-    AND quarter IN (1, 2, 3, 4)
-    """, engine)
-
-    # ✅ 유동 인구: 분기 데이터 평균
-    floating_df = pd.read_sql_query(f"""
-    SELECT year, quarter, floating_population, residential_population, working_population
-    FROM floating_population_stats
-    WHERE region_name = '{region}' AND region_code = {region_code}
-    AND year BETWEEN 2022 AND 2025
-    AND quarter IN (1, 2, 3, 4)
-    ORDER BY year, quarter
-    """, engine)
+    floating_df = pd.read_sql_query(
+        """
+        SELECT year, quarter, floating_population, residential_population, working_population
+        FROM floating_population_stats
+        WHERE region_name = %s AND region_code = %s
+          AND year BETWEEN %s AND %s AND quarter IN (1,2,3,4)
+        ORDER BY year, quarter
+        """,
+        engine,
+        params=(region, region_code, 2022, 2025),
+    )
 
     if not floating_df.empty:
         floating_pop = round(floating_df["floating_population"].mean())
         residential_pop = round(floating_df["residential_population"].mean())
         working_pop = round(floating_df["working_population"].mean())
     else:
-        floating_pop = residential_pop = working_pop = 0  # 또는 None, 또는 "데이터 없음"
+        floating_pop = residential_pop = working_pop = 0
 
+    # ---- zone 조회 & 매출 관련 집계 ----
+    zone_df = pd.read_sql_query(
+        """
+        SELECT zone_id, zone_name
+        FROM zone_table
+        WHERE region_name = %s
+        """,
+        engine,
+        params=(region,),
+    )
 
-    # ✅ sales 관련 데이터 조회 (연도별 테이블 + 분기 필터로 반복 조회)
+    if not zone_df.empty:
+        zone_ids = zone_df['zone_id'].tolist()
+        zone_names = dict(zip(zone_df['zone_id'].astype(str), zone_df['zone_name']))
+    else:
+        zone_names = {str(z): f"Zone {z}" for z in (zone_ids or [])}
+
     sales_years = [2022, 2023, 2024]
     quarters = [1, 2, 3, 4]
 
-    # ✅ zone_id, zone_name 가져오기
-    zone_query = f"""
-    SELECT zone_id, zone_name 
-    FROM zone_table 
-    WHERE region_name = '{region}'
-    """
-    zone_df = pd.read_sql_query(zone_query, engine)
-    zone_ids = zone_df['zone_id'].tolist()
-    zone_names = dict(zip(zone_df['zone_id'].astype(str), zone_df['zone_name']))
+    store_count_df_list, summary_df_list, gender_age_df_list, sales_day_df_list, sales_hour_df_list = [], [], [], [], []
 
-    zone_ids_str = ','.join(map(str, zone_ids))
-
-    # ✅ zone_store_count 테이블에서 점포 수 불러오기
-    store_count_df_list = []
+    # zone_store_count_{year}
     for year in sales_years:
         for quarter in quarters:
-            store_counts = pd.read_sql_query(f"""
-                SELECT zone_id, service_name, count, {year} AS year, {quarter} AS quarter
-                FROM zone_store_count_{year}
-                WHERE service_name = '{category_small}'
-                AND quarter = {quarter}
-                AND zone_id IN ({zone_ids_str})
-            """, engine)
-            store_counts["zone_id"] = store_counts["zone_id"].astype(str)
-            store_count_df_list.append(store_counts)
-            
-    # 결과 저장 리스트
-    summary_df_list = []
-    gender_age_df_list = []
-    sales_day_df_list = []
-    sales_hour_df_list = []
+            if zone_ids:
+                zid_placeholders = ",".join(["%s"] * len(zone_ids))
+                sc = pd.read_sql_query(
+                    f"""
+                    SELECT zone_id, service_name, count, {year} AS year, {quarter} AS quarter
+                    FROM zone_store_count_{year}
+                    WHERE service_name = %s AND quarter = %s
+                      AND zone_id IN ({zid_placeholders})
+                    """,
+                    engine,
+                    params=tuple([category_small, quarter] + [str(z) for z in zone_ids]),
+                )
+            else:
+                sc = pd.DataFrame(columns=["zone_id", "service_name", "count", "year", "quarter"])
+            if not sc.empty:
+                sc["zone_id"] = sc["zone_id"].astype(str)
+            store_count_df_list.append(sc)
 
-    # ✅ zone_id 반복 (매출 관련 테이블)
-    for zone_id in zone_ids:
+    # sales_summary_{year}, sales_by_..._{year}
+    for zid in (zone_ids or []):
         for year in sales_years:
             for quarter in quarters:
-                # 매출 요약
-                summary = pd.read_sql_query(f"""
-                    SELECT monthly_sales, monthly_count, weekday_sales, weekend_sales, {year} AS year, {quarter} AS quarter
+                summary = pd.read_sql_query(
+                    f"""
+                    SELECT monthly_sales, monthly_count, weekday_sales, weekend_sales,
+                           {year} AS year, {quarter} AS quarter
                     FROM sales_summary_{year}
-                    WHERE quarter = {quarter}
-                    AND zone_id = '{zone_id}'
-                    AND service_code = '{service_code}'
-                """, engine)
-                summary["zone_id"] = str(zone_id)  # zone_id 문자열화
+                    WHERE quarter = %s AND zone_id = %s AND service_code = %s
+                    """,
+                    engine,
+                    params=(quarter, str(zid), service_code),
+                )
+                summary["zone_id"] = str(zid)
                 summary_df_list.append(summary)
 
-                # 성별·연령대 매출
-                gender_age = pd.read_sql_query(f"""
-                    SELECT gender, age_group, SUM(sales_amount) AS total_sales, {year} AS year, {quarter} AS quarter
+                gender_age = pd.read_sql_query(
+                    f"""
+                    SELECT gender, age_group, SUM(sales_amount) AS total_sales,
+                           {year} AS year, {quarter} AS quarter
                     FROM sales_by_gender_age_{year}
-                    WHERE quarter = {quarter}
-                    AND zone_id = '{zone_id}'
-                    AND service_code = '{service_code}'
+                    WHERE quarter = %s AND zone_id = %s AND service_code = %s
                     GROUP BY gender, age_group
-                """, engine)
-                gender_age["zone_id"] = str(zone_id)
+                    """,
+                    engine,
+                    params=(quarter, str(zid), service_code),
+                )
+                gender_age["zone_id"] = str(zid)
                 gender_age_df_list.append(gender_age)
 
-                # 요일 매출
-                day = pd.read_sql_query(f"""
-                    SELECT day_of_week, SUM(sales_amount) AS total_sales, {year} AS year, {quarter} AS quarter
+                day = pd.read_sql_query(
+                    f"""
+                    SELECT day_of_week, SUM(sales_amount) AS total_sales,
+                           {year} AS year, {quarter} AS quarter
                     FROM sales_by_day_{year}
-                    WHERE quarter = {quarter}
-                    AND zone_id = '{zone_id}'
-                    AND service_code = '{service_code}'
+                    WHERE quarter = %s AND zone_id = %s AND service_code = %s
                     GROUP BY day_of_week
-                """, engine)
-                day["zone_id"] = str(zone_id)
+                    """,
+                    engine,
+                    params=(quarter, str(zid), service_code),
+                )
+                day["zone_id"] = str(zid)
                 sales_day_df_list.append(day)
 
-                # 시간대 매출
-                hour = pd.read_sql_query(f"""
-                    SELECT time_range, SUM(sales_amount) AS total_sales, {year} AS year, {quarter} AS quarter
+                hour = pd.read_sql_query(
+                    f"""
+                    SELECT time_range, SUM(sales_amount) AS total_sales,
+                           {year} AS year, {quarter} AS quarter
                     FROM sales_by_hour_{year}
-                    WHERE quarter = {quarter}
-                    AND zone_id = '{zone_id}'
-                    AND service_code = '{service_code}'
+                    WHERE quarter = %s AND zone_id = %s AND service_code = %s
                     GROUP BY time_range
-                """, engine)
-                hour["zone_id"] = str(zone_id)
+                    """,
+                    engine,
+                    params=(quarter, str(zid), service_code),
+                )
+                hour["zone_id"] = str(zid)
                 sales_hour_df_list.append(hour)
 
+    store_count_df = pd.concat(store_count_df_list, ignore_index=True) if store_count_df_list else pd.DataFrame()
+    summary_df = pd.concat(summary_df_list, ignore_index=True) if summary_df_list else pd.DataFrame()
+    gender_age_df = pd.concat(gender_age_df_list, ignore_index=True) if gender_age_df_list else pd.DataFrame()
+    sales_day_df = pd.concat(sales_day_df_list, ignore_index=True) if sales_day_df_list else pd.DataFrame()
+    sales_hour_df = pd.concat(sales_hour_df_list, ignore_index=True) if sales_hour_df_list else pd.DataFrame()
 
-    # concat으로 통합
-    store_count_df = pd.concat(store_count_df_list, ignore_index=True)
-    summary_df = pd.concat(summary_df_list, ignore_index=True)
-    gender_age_df = pd.concat(gender_age_df_list, ignore_index=True)
-    sales_day_df = pd.concat(sales_day_df_list, ignore_index=True)
-    sales_hour_df = pd.concat(sales_hour_df_list, ignore_index=True)
+    if not summary_df.empty and not store_count_df.empty:
+        summary_merged = pd.merge(summary_df, store_count_df, on=["zone_id", "year", "quarter"], how="left")
+    else:
+        summary_merged = pd.DataFrame(columns=["zone_id","year","quarter","monthly_sales","monthly_count","weekday_sales","weekend_sales","count"])
 
-    # ✅ 연도+분기+zone_id 기준으로 점포 수 join
-    summary_merged = pd.merge(
-        summary_df,
-        store_count_df,
-        on=["zone_id", "year", "quarter"],
-        how="left"
-    )
+    # KPI들
+    monthly_sales_total = summary_df["monthly_sales"].sum() if "monthly_sales" in summary_df else 0
+    monthly_count_total = summary_df["monthly_count"].sum() if "monthly_count" in summary_df else 0
+    avg_sales_per_order = (monthly_sales_total / monthly_count_total) if monthly_count_total else 0
 
-    # ✅ 점포 수 기준 평균 매출 계산
-    summary_merged["avg_sales_per_store"] = summary_merged.apply(
-        lambda row: row["monthly_sales"] / row["count"] if row["count"] and row["count"] > 0 else None,
-        axis=1
-    )
+    weekday_sales = _safe_first(summary_df, "weekday_sales", 0)
+    weekend_sales = _safe_first(summary_df, "weekend_sales", 0)
 
-    # === 아래는 기존 요약 지표 계산 ===
-
-    def get_value_safe(df, column):
-        if not df.empty and column in df.columns:
-            val = df[column].iloc[0]
-            return val if pd.notnull(val) else 0
-        return 0
-
-    # 총 매출과 건수 → 객단가
-    monthly_sales_total = summary_df["monthly_sales"].sum()
-    monthly_count_total = summary_df["monthly_count"].sum()
-    avg_sales_per_order = monthly_sales_total / monthly_count_total if monthly_count_total != 0 else 0
-
-    weekday_sales = get_value_safe(summary_df, "weekday_sales")
-    weekend_sales = get_value_safe(summary_df, "weekend_sales")
-
-    # 성별·연령대 상위 그룹
     if not gender_age_df.empty:
         top_row = gender_age_df.sort_values("total_sales", ascending=False).iloc[0]
-        gender_top = top_row["gender"]
-        age_top = top_row["age_group"]
+        gender_top = top_row.get("gender", "정보 없음")
+        age_top = top_row.get("age_group", "정보 없음")
     else:
-        gender_top = "정보 없음"
-        age_top = "정보 없음"
+        gender_top, age_top = "정보 없음", "정보 없음"
 
-    # 매출 피크 요일
     if not sales_day_df.empty and "total_sales" in sales_day_df.columns:
         top_day = sales_day_df.loc[sales_day_df["total_sales"].idxmax(), "day_of_week"]
     else:
         top_day = "정보 없음"
 
-    # 매출 피크 시간대
     if not sales_hour_df.empty and "total_sales" in sales_hour_df.columns:
         top_hour = sales_hour_df.loc[sales_hour_df["total_sales"].idxmax(), "time_range"]
     else:
         top_hour = "정보 없음"
 
-
-    # === 1. 연도별 점포 수 변화 ===
+    # 차트 데이터
     store_yearly_data = {
-        "labels": store_df["year"].tolist(),
-        "values": store_df["store_total"].tolist()
+        "labels": store_df["year"].tolist() if "year" in store_df else [],
+        "values": store_df["store_total"].tolist() if "store_total" in store_df else []
     }
-
-    # 연도별 개폐업 수
     open_close_data = {
-        "labels": open_close_df["year"].tolist(),
-        "open": open_close_df["num_open"].tolist(),
-        "close": open_close_df["num_close"].tolist()
+        "labels": open_close_df["year"].tolist() if "year" in open_close_df else [],
+        "open": open_close_df["num_open"].tolist() if "num_open" in open_close_df else [],
+        "close": open_close_df["num_close"].tolist() if "num_close" in open_close_df else []
     }
-
-    # === 3. 신생기업 생존율 ===
     survival_data = {
         "labels": ["1년", "3년", "5년"],
         "values": [
-            survival_df["avg_survival_rate_1yr"][0],
-            survival_df["avg_survival_rate_3yr"][0],
-            survival_df["avg_survival_rate_5yr"][0]
+            _safe_first(survival_df, "avg_survival_rate_1yr"),
+            _safe_first(survival_df, "avg_survival_rate_3yr"),
+            _safe_first(survival_df, "avg_survival_rate_5yr")
         ]
     }
-    # 평균 영업 기간 데이터
     operating_period_data = {
         "labels": ["10년 평균", "30년 평균"],
         "values": [
-            avg_years_df["avg_10yr"][0] if not avg_years_df.empty else 0,
-            avg_years_df2["avg_30yr"][0] if not avg_years_df2.empty else 0
+            _safe_first(avg_years_df, "avg_10yr"),
+            _safe_first(avg_years_df2, "avg_30yr")
         ]
     }
-
-    # === 4. 임대료 비교 ===
     rent_data = {
         "labels": ["1층", "1층 외"],
         "values": [
-            rent_df["avg_rent_first_floor"][0],
-            rent_df["avg_rent_other_floors"][0]
+            _safe_first(rent_df, "avg_rent_first_floor"),
+            _safe_first(rent_df, "avg_rent_other_floors")
         ]
     }
-
-    # === 5. 유동인구 추이 ===
     floating_data = {
-        "labels": (floating_df["year"].astype(str) + "Q" + floating_df["quarter"].astype(str)).tolist(),
-        "values": floating_df["floating_population"].tolist()
+        "labels": (floating_df["year"].astype(str) + "Q" + floating_df["quarter"].astype(str)).tolist() if not floating_df.empty else [],
+        "values": floating_df["floating_population"].tolist() if not floating_df.empty else []
     }
 
-    # === 6. 매출 관련 데이터 (zone별) ===
     sales_data = {}
-    for zone_id in summary_merged["zone_id"].unique():
-        summary_zone = summary_merged[summary_merged["zone_id"] == zone_id]
-        gender_age_zone = gender_age_df[gender_age_df["zone_id"] == zone_id]
-        sales_day_zone = sales_day_df[sales_day_df["zone_id"] == zone_id]
-        sales_hour_zone = sales_hour_df[sales_hour_df["zone_id"] == zone_id]
+    for zid in set(summary_merged["zone_id"].tolist()) if not summary_merged.empty else []:
+        summary_zone = summary_merged[summary_merged["zone_id"] == zid]
+        gender_age_zone = gender_age_df[gender_age_df["zone_id"] == zid]
+        sales_day_zone = sales_day_df[sales_day_df["zone_id"] == zid]
+        sales_hour_zone = sales_hour_df[sales_hour_df["zone_id"] == zid]
 
-        # --- 점포 수 가져오기 ---
-        store_count = summary_zone["count"].mean() if "count" in summary_zone.columns else 0
+        store_count = summary_zone["count"].mean() if "count" in summary_zone else 0
 
-        # 1) 요일별 매출 (점포당 평균 매출 원 단위)
-        sales_day_sorted = sales_day_zone.sort_values("day_of_week")
-        if store_count and store_count > 0:
-            day_values = (sales_day_sorted["total_sales"] / store_count).tolist()
-        else:
-            day_values = [0] * len(sales_day_sorted)
-        sales_by_day = {
-            "labels": sales_day_sorted["day_of_week"].tolist(),
-            "values": day_values
+        day_values = (sales_day_zone["total_sales"] / store_count).tolist() if store_count else [0]*len(sales_day_zone)
+        hour_values = (sales_hour_zone["total_sales"] / store_count).tolist() if store_count else [0]*len(sales_hour_zone)
+
+        gender_df = gender_age_zone[gender_age_zone["gender"].isin(["남성","여성"])].groupby("gender", as_index=False)["total_sales"].sum()
+        age_df = gender_age_zone[~gender_age_zone["gender"].isin(["남성","여성"])].copy()
+        if not age_df.empty:
+            age_df["age_group"] = age_df["age_group"].astype(str)
+            age_df = age_df.groupby("age_group", as_index=False)["total_sales"].sum()
+
+        weekday_sales_zone = (summary_zone["weekday_sales"].sum() / store_count) if store_count else 0
+        weekend_sales_zone = (summary_zone["weekend_sales"].sum() / store_count) if store_count else 0
+
+        sales_data[str(zid)] = {
+            "sales_by_day": {"labels": sales_day_zone["day_of_week"].tolist(), "values": day_values},
+            "sales_by_hour": {"labels": sales_hour_zone["time_range"].tolist(), "values": hour_values},
+            "sales_by_gender": {"labels": gender_df["gender"].tolist(), "values": gender_df["total_sales"].tolist()},
+            "sales_by_age_group": {
+                "labels": age_df["age_group"].tolist() if not age_df.empty else [],
+                "values": age_df["total_sales"].tolist() if not age_df.empty else []
+            },
+            "weekday_vs_weekend": {"labels": ["평일","주말"], "values": [weekday_sales_zone, weekend_sales_zone]},
+            "avg_price_per_order": {"labels": ["객단가"], "values": [
+                (summary_zone["monthly_sales"].sum() / summary_zone["monthly_count"].sum()) if summary_zone["monthly_count"].sum() else 0
+            ]}
         }
 
-        # 2) 시간대별 매출 (점포당 평균 매출 원 단위)
-        if store_count and store_count > 0:
-            hour_values = (sales_hour_zone["total_sales"] / store_count).tolist()
-        else:
-            hour_values = [0] * len(sales_hour_zone)
-        sales_by_hour = {
-            "labels": sales_hour_zone["time_range"].tolist(),
-            "values": hour_values
-        }
-
-        # 3) 성별 매출 (총합 그대로 사용)
-        gender_df = gender_age_zone[gender_age_zone["gender"].isin(["남성", "여성"])] \
-            .groupby("gender", as_index=False)["total_sales"].sum()
-        sales_by_gender = {
-            "labels": gender_df["gender"].tolist(),
-            "values": gender_df["total_sales"].tolist()
-        }
-
-        # 4) 연령대별 매출 (총합 그대로 사용)
-        age_df = gender_age_zone[~gender_age_zone["gender"].isin(["남성", "여성"])].copy()
-        age_df["age_group"] = age_df["age_group"].astype(str)
-        age_df["age_group"] = age_df["age_group"].apply(lambda x: "60대 이상" if "60" in x and "이상" in x else x + "대")
-        age_df = age_df.groupby("age_group", as_index=False)["total_sales"].sum()
-        sales_by_age_group = {
-            "labels": age_df["age_group"].tolist(),
-            "values": age_df["total_sales"].tolist()
-        }
-
-        # 5) 평일 vs 주말 매출 (점포당 평균)
-        weekday_sales = summary_zone["weekday_sales"].sum() / store_count if store_count else 0
-        weekend_sales = summary_zone["weekend_sales"].sum() / store_count if store_count else 0
-        weekday_vs_weekend = {
-            "labels": ["평일", "주말"],
-            "values": [weekday_sales, weekend_sales]
-        }
-
-        # 6) 객단가 (총 매출 ÷ 건수)
-        monthly_sales_total = summary_zone["monthly_sales"].sum()
-        monthly_count_total = summary_zone["monthly_count"].sum()
-        avg_price_per_order = monthly_sales_total / monthly_count_total if monthly_count_total else 0
-        avg_price_data = {
-            "labels": ["객단가"],
-            "values": [avg_price_per_order]
-        }
-
-        sales_data[str(zone_id)] = {
-            "sales_by_day": sales_by_day,
-            "sales_by_hour": sales_by_hour,
-            "sales_by_gender": sales_by_gender,
-            "sales_by_age_group": sales_by_age_group,
-            "weekday_vs_weekend": weekday_vs_weekend,
-            "avg_price_per_order": avg_price_data
-        }
-
-    # === 7. zone_summary_text 생성
+    # zone 텍스트 요약
     zone_summary_text = ""
-    for zid, zname in zone_names.items():
-        zdata = sales_data[str(zid)]
-        top_gender = max(zip(zdata["sales_by_gender"]["labels"], zdata["sales_by_gender"]["values"]), key=lambda x:x[1])[0]
-        top_day = max(zip(zdata["sales_by_day"]["labels"], zdata["sales_by_day"]["values"]), key=lambda x:x[1])[0]
-        avg_price = zdata["avg_price_per_order"]["values"][0]
-        zone_summary_text += f"\n[{zname}] - 주요 소비층: {top_gender}, 피크 요일: {top_day}, 객단가: {avg_price:,.0f}원"
+    for zid, zname in (zone_names or {}).items():
+        zdata = sales_data.get(str(zid))
+        if not zdata:
+            continue
+        if zdata["sales_by_gender"]["labels"]:
+            top_gender = max(zip(zdata["sales_by_gender"]["labels"], zdata["sales_by_gender"]["values"]), key=lambda x: x[1])[0]
+        else:
+            top_gender = "정보 없음"
+        if zdata["sales_by_day"]["labels"]:
+            top_day_z = max(zip(zdata["sales_by_day"]["labels"], zdata["sales_by_day"]["values"]), key=lambda x: x[1])[0]
+        else:
+            top_day_z = "정보 없음"
+        avg_price = zdata["avg_price_per_order"]["values"][0] if zdata["avg_price_per_order"]["values"] else 0
+        zone_summary_text += f"\n[{zname}] - 주요 소비층: {top_gender}, 피크 요일: {top_day_z}, 객단가: {avg_price:,.0f}원"
 
-    # === 8. 최종 JSON 구조 ===
     chart_data = {
         "store_yearly": store_yearly_data,
         "open_close": open_close_data,
@@ -416,22 +377,7 @@ def run_report (gu_name, region, category_large, category_small, purpose, region
         "sales": sales_data,
         "zone_names": zone_names
     }
-
-    # ✅ 매출 피크 시간대
-    if not sales_hour_df.empty and "total_sales" in sales_hour_df.columns:
-        top_hour = sales_hour_df.loc[sales_hour_df["total_sales"].idxmax(), "time_range"]
-    else:
-        top_hour = "정보 없음"
-        
-    # JSON 저장 (app.py에서 로드하거나 바로 render_template로 넘길 수 있음)
-    with open("chart_data.json", "w", encoding="utf-8") as f:
-        json.dump(chart_data, f, ensure_ascii=False)
-
-    print("chart_data.json 저장 완료")
-
-
-    print("3. GPT 프롬프트 생성 및 요청 시작")
-
+    # ---------- GPT 프롬프트 (네가 원하는 상세 형식 유지) ----------
     region_gpt_prompt = f"""
     서울특별시 {gu_name} {region} 지역의 상권 특성을 분석하려고 해.
 
@@ -442,13 +388,10 @@ def run_report (gu_name, region, category_large, category_small, purpose, region
     - 직장 인구: {working_pop:,}명/ha
 
     요청 사항:
-    1. 첫 문단은 **지역의 특성을 2문장으로 요약**해줘. (예: 고급 주거지와 관광지가 공존하는 지역)
-    2. 두 번째 문단은 위 수치를 바탕으로, **상권의 성격과 소비층 유형(예: 관광객 위주, 직장인 중심 등)**을 **풍부하게 2~3문장 정도**로 설명해줘.
-    3. 문단 사이에는 빈 줄 한 줄을 넣고, 문장에는 번호를 붙이지 마.
-
-    반드시 전문가 보고서처럼 문체는 자연스럽고 간결하게 해줘.
+    1) 첫 문단은 지역 특성을 2문장으로 요약,
+    2) 두 번째 문단은 수치를 바탕으로 상권 성격/소비층 유형을 2~3문장,
+    3) 문단 사이 빈 줄 1줄, 번호 붙이지 말 것.
     """
-
     region_desc_combined = client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": region_gpt_prompt}]
@@ -458,9 +401,7 @@ def run_report (gu_name, region, category_large, category_small, purpose, region
     region_desc = region_desc_lines[0] if len(region_desc_lines) > 0 else ""
     region_pop_desc = region_desc_lines[1] if len(region_desc_lines) > 1 else ""
 
-    print("5. 최종 리포트 입력 생성 시작")
-
-    # ✅ GPT에 입력할 구조화 데이터 만들기
+    # 최종 입력
     actual_input = f"""
     서울특별시 {gu_name} {region}에서의 {category_small} {purpose}을(를) 위한 리포트입니다.
 
@@ -511,9 +452,9 @@ def run_report (gu_name, region, category_large, category_small, purpose, region
     - 매출 피크 시간대: {top_hour}
     - Zone별 세부 데이터 요약 : {zone_summary_text}
 
-    위 정보를 활용해 다음 구조로 작성해줘:
-    1) {region} 전체 상권 평가 및 공통 전략
-    2) Zone별 특화 전략: 각 zone 이름을 소제목으로 두고, 해당 zone의 소비 패턴 차이에 맞춘 전략 제안
+    위 정보를 활용해 다음을 작성해줘:
+    {region} 전체 상권 평가 및 공통 전략
+    구역`별 특화 전략: 각 zone 이름을 소제목으로 두고, 해당 zone의 소비 패턴 차이에 맞춘 전략 제안
     위 데이터를 바탕으로, 아래 지침에 따라 전문가 리포트를 작성해줘.
 
     예시처럼 ① 제목 형식, ② 문단 구성, ③ 전략 제안 방식, ④ 자연어 문체를 모두 그대로 따르도록 해줘.
@@ -739,9 +680,9 @@ def run_report (gu_name, region, category_large, category_small, purpose, region
         ]
     )
 
-    print("7. GPT 리포트 응답 수신 완료")
+    # GPT 응답 받기
+    report = response.choices[0].message.content or ""
 
-    # ✅ GPT 응답 받기
     # GPT 응답 받기
     report = response.choices[0].message.content
 
@@ -756,7 +697,19 @@ def run_report (gu_name, region, category_large, category_small, purpose, region
     sections_sorted = sorted(sections, key=lambda x: 0 if "👉 종합 평가" in x else 1)
     report_reordered = "\n".join([s.strip() for s in sections_sorted if s.strip()])
 
+    # 최종 report_text 정의
     header_line = f"서울특별시 {gu_name} {region}에서의 {category_small} {purpose}을(를) 위한 리포트입니다.\n\n"
+    report_text = report_reordered
 
-    with open("report.txt", "w", encoding="utf-8") as f:
-        f.write(header_line + report_reordered)
+    # zone_texts 생성
+    zone_texts = {}
+    for zid, zname in (chart_data.get("zone_names") or {}).items():
+        zdata = chart_data["sales"].get(str(zid))
+        if not zdata:
+            continue
+        avg_price = zdata["avg_price_per_order"]["values"][0] if zdata["avg_price_per_order"]["values"] else 0
+        first_day = zdata['sales_by_day']['labels'][0] if zdata['sales_by_day']['labels'] else '정보 없음'
+        zone_texts[str(zid)] = f"{zname} — 객단가 {avg_price:,.0f}원, 요일피크 {first_day}"
+
+    # 최종 반환
+    return report_text, chart_data, [str(z) for z in zone_ids], zone_texts

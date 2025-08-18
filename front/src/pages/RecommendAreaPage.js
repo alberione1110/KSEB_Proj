@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import '../App.css'
 import ksebLogo from '../img/kseb_logo.png'
@@ -11,7 +11,7 @@ function RecommendAreaPage() {
   const {
     role,
     gu_name,
-    region,
+    region,             // 입력받았을 수도 있으나, 여기서는 추천된 district를 최종 선택
     category_large,
     category_small,
     rawMonthlySales,
@@ -21,23 +21,108 @@ function RecommendAreaPage() {
   const [recommendations, setRecommendations] = useState([])
   const [expandedIndex, setExpandedIndex] = useState(null)
   const [selectedIndex, setSelectedIndex] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
+  const [debugPayload, setDebugPayload] = useState(null)
+
+  // 최신 요청만 반영 (업종 페이지와 동일 패턴)
+  const reqIdRef = useRef(0)
+
+  async function fetchWithRetry(url, opts, tries = 2) {
+    try {
+      const res = await fetch(url, opts)
+      const txt = await res.text()
+      let data = {}
+      try {
+        data = JSON.parse(txt)
+      } catch {}
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} ${txt}`)
+      return data
+    } catch (e) {
+      const s = String(e)
+      if (
+        tries > 1 &&
+        (s.includes('ERR_EMPTY_RESPONSE') ||
+          s.includes('Failed to fetch') ||
+          s.includes('NetworkError'))
+      ) {
+        return fetchWithRetry(url, opts, tries - 1)
+      }
+      throw e
+    }
+  }
 
   useEffect(() => {
     window.scrollTo(0, 0)
-    if (gu_name && category_small) {
-      fetch('http://localhost:5001/api/recommend/area', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ gu_name, category_small }),
-      })
-        .then((res) => res.json())
-        .then((data) => {
-          setRecommendations(data.recommendations || [])
-        })
-        .catch((err) => {
-          console.error('추천 요청 실패:', err)
-        })
+    if (!gu_name || !category_small) {
+      setError('선택된 구/업종(소분류) 정보가 없습니다. 메인에서 다시 선택해 주세요.')
+      setRecommendations([])
+      return
     }
+
+    const myReqId = ++reqIdRef.current
+    const controller = new AbortController()
+    const signal = controller.signal
+
+    ;(async () => {
+      try {
+        setLoading(true)
+        setError(null)
+        setExpandedIndex(null)
+        setSelectedIndex(null)
+
+        const idemKey =
+          (typeof crypto !== 'undefined' && crypto.randomUUID)
+            ? crypto.randomUUID()
+            : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+
+        const data = await fetchWithRetry('http://localhost:5001/api/recommend/area', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Idempotency-Key': idemKey,
+          },
+          body: JSON.stringify({ gu_name, category_small }),
+          signal,
+        })
+
+        if (myReqId !== reqIdRef.current) return
+        setDebugPayload(data)
+
+        // 다양한 스키마 대응
+        let arr = []
+        if (Array.isArray(data?.recommendations)) {
+          arr = data.recommendations
+        } else if (data && typeof data === 'object') {
+          const key = category_small || Object.keys(data)[0]
+          if (Array.isArray(data[key])) arr = data[key]
+        }
+
+        arr = arr.map((x) => ({
+          district: (x?.district ?? x?.행정동명 ?? '').toString().trim(),
+          reason: (x?.reason ?? x?.사유 ?? '').toString().trim(),
+          score:
+            typeof x?.score === 'number'
+              ? x.score
+              : typeof x?.['지역_추천점수'] === 'number'
+              ? x['지역_추천점수']
+              : null,
+        }))
+
+        setRecommendations(arr)
+        if (arr.length === 0) setError('추천 결과가 비어 있습니다.')
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          console.error('[recommend/area] fetch error:', err)
+          setError('지역 추천 요청 실패')
+          setRecommendations([])
+        }
+      } finally {
+        if (myReqId === reqIdRef.current) setLoading(false)
+      }
+    })()
+
+    return () => controller.abort()
   }, [gu_name, category_small])
 
   return (
@@ -50,17 +135,19 @@ function RecommendAreaPage() {
         backgroundSize: 'cover',
         backgroundPosition: 'center',
         color: 'white',
+        paddingBottom: '5rem',
+        // ✅ 오버레이가 콘텐츠 전체 높이를 기준으로 깔리도록 기준 컨테이너 지정
+        position: 'relative',
       }}
     >
+      {/* ✅ 콘텐츠 전체 높이에 따라 함께 늘어나는 오버레이 */}
       <div
         style={{
           position: 'absolute',
-          top: 0,
-          left: 0,
-          width: '100%',
-          height: '100%',
+          inset: 0,
           backgroundColor: 'rgba(0, 0, 0, 0.8)',
           zIndex: 0,
+          pointerEvents: 'none', // 이벤트 가로채지 않도록
         }}
       />
 
@@ -106,21 +193,29 @@ function RecommendAreaPage() {
         <h1
           style={{
             textAlign: 'center',
-            marginBottom: '2rem',
+            marginBottom: '1rem',
             color: 'white',
             fontSize: '2rem',
             fontWeight: 'bold',
           }}
         >
-          {category_small || '업종 없음'}에 적합한 지역은?
+          {`${gu_name || ''}`}에서 <span style={{ color: '#a6b0ff' }}>{category_small || '업종 없음'}</span>에 적합한 지역은?
         </h1>
 
-        <div
-          style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}
-        >
+        <div style={{ textAlign: 'center', marginBottom: '1rem', opacity: 0.9 }}>
+          {loading ? '로딩 중...' : recommendations.length ? `총 ${recommendations.length}건` : ''}
+        </div>
+
+        {error && (
+          <div style={{ textAlign: 'center', marginBottom: '1rem', color: '#ffb3b3', whiteSpace: 'pre-wrap' }}>
+            {error}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
           {recommendations.map((rec, index) => (
             <div
-              key={index}
+              key={`${rec.district}-${index}`}
               onClick={() => setSelectedIndex(index)}
               style={{
                 backgroundColor: selectedIndex === index ? '#e0e7ff' : 'white',
@@ -154,11 +249,11 @@ function RecommendAreaPage() {
                   marginBottom: '0.5rem',
                 }}
               >
-                {rec.district}
+                {rec.district || '행정동 미상'}
               </h2>
 
               {expandedIndex === index ? (
-                <p style={{ color: '#444' }}>{rec.reason}</p>
+                <p style={{ color: '#444' }}>{rec.reason || '사유 없음'}</p>
               ) : (
                 <button
                   onClick={(e) => {
@@ -207,16 +302,12 @@ function RecommendAreaPage() {
                 alert('지역을 하나 선택해주세요!')
                 return
               }
-              const selectedFull = recommendations[selectedIndex].district
-              const parts = selectedFull.split(' ')
-              const selectedGu = parts[0] || ''
-              const selectedDong = parts[1] || ''
-
+              const chosen = recommendations[selectedIndex]
               navigate('/report', {
                 state: {
                   role,
-                  gu_name: selectedGu,
-                  region: selectedDong,
+                  gu_name,
+                  region: chosen.district,          // ✅ 추천된 행정동을 region으로 전달
                   category_large,
                   category_small,
                   rawMonthlySales,
@@ -224,6 +315,7 @@ function RecommendAreaPage() {
                 },
               })
             }}
+            disabled={loading || recommendations.length === 0}
             style={{
               backgroundColor: '#262f95ff',
               color: 'white',
@@ -231,12 +323,22 @@ function RecommendAreaPage() {
               borderRadius: '12px',
               fontWeight: 'bold',
               border: 'none',
-              cursor: 'pointer',
+              cursor: loading || recommendations.length === 0 ? 'not-allowed' : 'pointer',
+              opacity: loading || recommendations.length === 0 ? 0.6 : 1,
             }}
           >
             리포트 받으러 가기
           </button>
         </div>
+
+        {!loading && recommendations.length === 0 && debugPayload && (
+          <details style={{ marginTop: '1rem', fontSize: '.85rem', color: '#ddd' }}>
+            <summary>디버그: 서버 응답 보기</summary>
+            <pre style={{ whiteSpace: 'pre-wrap' }}>
+              {JSON.stringify(debugPayload, null, 2)}
+            </pre>
+          </details>
+        )}
       </div>
     </div>
   )
